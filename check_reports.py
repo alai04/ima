@@ -25,7 +25,8 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
-ROOT_KB_ID = "60gC-vp9_FHU6mEREeHc2KQxgA3j22s_CZSOw5HltUA="
+ROOT_KB_NAME = "环球研报直通车"
+ROOT_KB_ID = ""
 
 # ── 路径 ──────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -136,6 +137,20 @@ def call_ima_api(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as e:
         print(f"[IMA API] error on {endpoint}: {e}")
         return {"code": -1, "msg": str(e)}
+
+
+def get_knowledge_base_id() -> str:
+    """获取知识库 ID。"""
+    global ROOT_KB_ID
+    if not ROOT_KB_ID:
+        # 如果未设置，尝试通过名称搜索
+        result = call_ima_api("search_knowledge_base", {"query": ROOT_KB_NAME, "cursor": "", "limit": 20})
+        if result.get("code") == 0:
+            data = result.get("data", {})
+            kb_list = data.get("info_list", [])
+            if kb_list:
+                ROOT_KB_ID = kb_list[0].get("kb_id", "")
+    return ROOT_KB_ID
 
 
 def search_knowledge(query: str) -> list[dict[str, Any]]:
@@ -352,6 +367,7 @@ def main() -> None:
         return
 
     init_db()
+    get_knowledge_base_id()
     collect_reports()
     download_and_send_new_reports()
 
