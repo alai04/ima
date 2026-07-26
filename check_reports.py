@@ -15,16 +15,19 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+from O365 import Account
 
 load_dotenv()
 
 # ── 环境变量 ──────────────────────────────────────────────────────────
 IMA_API_KEY = os.getenv("IMA_API_KEY", "")
 IMA_CLIENT_ID = os.getenv("IMA_CLIENT_ID", "")
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
 KEYWORD_IGNORE = os.getenv("KEYWORD_IGNORE", "")
+O365_CLIENT_ID = os.getenv("O365_CLIENT_ID", "")
+O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET", "")
+O365_TENANT_ID = os.getenv("O365_TENANT_ID", "common")
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
 ROOT_KB_NAME = "环球研报直通车"
 ROOT_KB_ID = ""
@@ -232,50 +235,55 @@ def download_report(media_id: str, title: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Email (Resend)
+# Email (O365)
 # ═══════════════════════════════════════════════════════════════════════
+
+_account: Account | None = None
+
+
+def _get_account() -> Account | None:
+    """懒初始化 O365 Account，认证后全局复用。"""
+    global _account
+    if _account is not None:
+        return _account
+
+    if not O365_CLIENT_ID or not O365_CLIENT_SECRET:
+        print("[o365] 缺少 O365_CLIENT_ID / O365_CLIENT_SECRET 配置")
+        return None
+
+    credentials = (O365_CLIENT_ID, O365_CLIENT_SECRET)
+    _account = Account(credentials, auth_flow_type="credentials", tenant_id=O365_TENANT_ID)
+
+    if _account.authenticate():
+        print("[o365] 认证成功")
+        return _account
+    else:
+        print("[o365] 认证失败")
+        _account = None
+        return None
 
 
 def send_email(title: str, filepath: Path) -> bool:
-    """通过 Resend API 发送带附件的邮件。成功返回 True。"""
-    if not RESEND_API_KEY or not EMAIL_FROM or not EMAIL_TO:
-        print("[sendmail] 缺少 RESEND_API_KEY / EMAIL_FROM / EMAIL_TO 配置，跳过")
+    """通过 O365 发送带附件的邮件。成功返回 True。"""
+    if not EMAIL_FROM or not EMAIL_TO:
+        print("[sendmail] 缺少 EMAIL_FROM / EMAIL_TO 配置，跳过")
         return False
 
-    content_bytes = filepath.read_bytes()
-
-    payload: dict[str, Any] = {
-        "from": EMAIL_FROM,
-        "to": [EMAIL_TO],
-        "subject": f"环球研报: {title}",
-        "html": f"<p>附件为最新研报：<strong>{title}</strong></p>",
-        "attachments": [
-            {
-                "filename": title,
-                "content": list(content_bytes),
-            }
-        ],
-    }
+    account = _get_account()
+    if not account:
+        print("[sendmail] O365 未认证，跳过")
+        return False
 
     try:
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            print(f"[sendmail] ✓ {title} (email id: {data.get('id', '?' )})")
-            return True
-    except httpx.HTTPStatusError as e:
-        print(f"[sendmail] 失败 ({title}): {e}")
-        print(f"  Response: {e.response.text[:500]}")
-        return False
-    except httpx.HTTPError as e:
+        m = account.new_message(resource=EMAIL_FROM)
+        m.to.add(EMAIL_TO)
+        m.subject = f"环球研报: {title}"
+        m.body = f"<p>附件为最新研报：<strong>{title}</strong></p>"
+        m.attachments.add(str(filepath))
+        m.send()
+        print(f"[sendmail] ✓ {title}")
+        return True
+    except Exception as e:
         print(f"[sendmail] 失败 ({title}): {e}")
         return False
 
