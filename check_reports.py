@@ -24,6 +24,7 @@ IMA_CLIENT_ID = os.getenv("IMA_CLIENT_ID", "")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
+KEYWORD_IGNORE = os.getenv("KEYWORD_IGNORE", "")
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
 ROOT_KB_NAME = "环球研报直通车"
 ROOT_KB_ID = ""
@@ -284,10 +285,22 @@ def send_email(title: str, filepath: Path) -> bool:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _should_ignore(title: str) -> bool:
+    """检查标题是否命中 KEYWORD_IGNORE 过滤词（逗号分隔，大小写不敏感）。"""
+    if not KEYWORD_IGNORE:
+        return False
+    keywords = [kw.strip().lower() for kw in KEYWORD_IGNORE.split(",") if kw.strip()]
+    if not keywords:
+        return False
+    title_lower = title.lower()
+    return any(kw in title_lower for kw in keywords)
+
+
 def collect_reports() -> int:
     """搜索最近 3 天研报并入库，返回新增数量。"""
     today = datetime.now(timezone.utc)
     new_count = 0
+    ignored_count = 0
     for offset in reversed(range(3)):
         dt = today - timedelta(days=offset)
         date_str = dt.strftime("%y%m%d")
@@ -299,11 +312,15 @@ def collect_reports() -> int:
             title = item.get("title", "")
             if not media_id or not title:
                 continue
+            if _should_ignore(title):
+                ignored_count += 1
+                print(f"[ignore] 跳过: {title}")
+                continue
             if insert_report(media_id, title):
                 new_count += 1
                 print(f"[db] 新增: {title}")
 
-    print(f"[collect] 合计新增 {new_count} 条")
+    print(f"[collect] 合计新增 {new_count} 条，忽略 {ignored_count} 条")
     return new_count
 
 
