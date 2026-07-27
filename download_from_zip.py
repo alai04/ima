@@ -52,7 +52,10 @@ def main() -> None:
             print(f"  → {title} ...", end=" ")
 
             # 查 DB
-            title_pattern = title[:15] + "%" + title[-10:]
+            if len(title) < 25:
+                title_pattern = title
+            else:
+                title_pattern = title[:15] + "%" + title[-10:]
             with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
                 row = conn.execute(
                     "SELECT media_id, title, downloaded_ts FROM reports WHERE title LIKE ?", (title_pattern,)
