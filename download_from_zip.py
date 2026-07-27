@@ -52,9 +52,10 @@ def main() -> None:
             print(f"  → {title} ...", end=" ")
 
             # 查 DB
+            title_pattern = title[:15] + "%" + title[-10:]
             with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
                 row = conn.execute(
-                    "SELECT media_id, downloaded_ts FROM reports WHERE title = ?", (title,)
+                    "SELECT media_id, title, downloaded_ts FROM reports WHERE title LIKE ?", (title_pattern,)
                 ).fetchone()
 
             if row is None:
@@ -62,14 +63,14 @@ def main() -> None:
                 skipped_no_record += 1
                 continue
 
-            media_id, downloaded_ts = row
+            media_id, db_title, downloaded_ts = row
             if downloaded_ts > 0:
                 print("跳过（已下载）")
                 skipped_downloaded += 1
                 continue
 
             # 解压
-            dest = out_dir / title
+            dest = out_dir / db_title
             try:
                 zf.extract(name, path=out_dir)
                 # extract 会保留原始目录结构，需要移动到目标位置
