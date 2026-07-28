@@ -37,28 +37,30 @@ def main() -> None:
     extracted = 0
 
     with zipfile.ZipFile(zip_path) as zf:
-        pdf_entries = [
-            name for name in zf.namelist()
-            if name.lower().endswith(".pdf") and not name.endswith("/")
+        pdf_members = [
+            info for info in zf.infolist()
+            if info.filename.lower().endswith(".pdf") and not info.is_dir()
         ]
-        if not pdf_entries:
+        if not pdf_members:
             print("zip 中没有 PDF 文件")
             return
 
-        print(f"zip 中共 {len(pdf_entries)} 个 PDF 文件\n")
+        print(f"zip 中共 {len(pdf_members)} 个 PDF 文件\n")
 
-        for name in pdf_entries:
-            title = Path(name).name.encode('cp437').decode('utf8')  # 去掉路径前缀，只取文件名，转换编码
+        for info in pdf_members:
+            title = Path(info.filename).name.encode('cp437').decode('utf8')  # 去掉路径前缀，只取文件名，转换编码
             print(f"  → {title} ...", end=" ")
 
-            # 查 DB
+            # 查 DB（zip 内文件名可能被截断，对长文件名用 LIKE 模糊匹配）
             if len(title) < 25:
                 title_pattern = title
             else:
                 title_pattern = title[:15] + "%" + title[-10:]
+
             with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
                 row = conn.execute(
-                    "SELECT media_id, title, downloaded_ts FROM reports WHERE title LIKE ?", (title_pattern,)
+                    "SELECT media_id, title, downloaded_ts FROM reports WHERE title LIKE ?",
+                    (title_pattern,),
                 ).fetchone()
 
             if row is None:
@@ -72,27 +74,15 @@ def main() -> None:
                 skipped_downloaded += 1
                 continue
 
-            # 解压
+            # 直接读取 zip 内容写入目标文件（避免 zf.extract 创建深层路径导致 ENAMETOOLONG）
             dest = out_dir / db_title
             try:
-                zf.extract(name, path=out_dir)
-                # extract 会保留原始目录结构，需要移动到目标位置
-                extracted_path = out_dir / name
-                if extracted_path != dest:
-                    extracted_path.rename(dest)
-                    # 清理可能残留的空目录
-                    parent = extracted_path.parent
-                    while parent != out_dir and parent != parent.parent:
-                        try:
-                            parent.rmdir()
-                        except OSError:
-                            break
-                        parent = parent.parent
+                with zf.open(info) as source, open(dest, "wb") as target:
+                    target.write(source.read())
             except Exception as e:
                 print(f"解压失败: {e}")
                 continue
 
-            # 标记已下载
             check_reports.mark_downloaded(media_id)
             print("✓")
             extracted += 1
