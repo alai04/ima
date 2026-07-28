@@ -87,10 +87,14 @@ def insert_report(media_id: str, title: str) -> bool:
 
 
 def get_reports_to_download() -> list[dict[str, Any]]:
-    """获取尚未下载的研报，按插入时间从近到远排序。"""
+    """获取尚未下载的研报（仅限 48 小时内入库的），按插入时间从近到远排序。"""
+    cutoff = int(time.time()) - 48 * 3600
     with sqlite3.connect(str(DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT media_id, title FROM reports WHERE downloaded_ts = 0 ORDER BY created_ts DESC"
+            "SELECT media_id, title FROM reports "
+            "WHERE downloaded_ts = 0 AND created_ts > ? "
+            "ORDER BY created_ts DESC",
+            (cutoff,),
         ).fetchall()
     return [{"media_id": r[0], "title": r[1]} for r in rows]
 
