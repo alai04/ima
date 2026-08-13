@@ -12,6 +12,9 @@ wheels/
 # Project data
 reports.db
 downloaded_reports/
+*.zip
+*.log
+*.txt
 
 # Environment secrets
 .env

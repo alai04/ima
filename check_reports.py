@@ -361,6 +361,8 @@ def download_and_send_new_reports() -> tuple[int, int]:
             if send_email(title, filepath):
                 mark_sent(item["media_id"])
                 sent_count += 1
+            else:
+                break  # 发送失败，终止后续处理
 
     # ── Phase 2: 逐个下载并立即发送 ──
     to_download = get_reports_to_download()
