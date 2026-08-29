@@ -59,15 +59,21 @@ def init_db() -> None:
                 title      TEXT NOT NULL,
                 downloaded_ts INTEGER DEFAULT 0,
                 sendmail_ts   INTEGER DEFAULT 0,
-                created_ts    INTEGER DEFAULT 0
+                created_ts    INTEGER DEFAULT 0,
+                path          TEXT DEFAULT 'downloaded_reports'
             )
             """
         )
-        # 兼容旧表：补上 created_ts 列
-        try:
-            conn.execute("ALTER TABLE reports ADD COLUMN created_ts INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # 列已存在
+        # 兼容旧表：补上新增列
+        migrations = [
+            ("created_ts", "INTEGER DEFAULT 0"),
+            ("path", "TEXT DEFAULT 'downloaded_reports'"),
+        ]
+        for column, definition in migrations:
+            try:
+                conn.execute(f"ALTER TABLE reports ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
         conn.commit()
 
 
@@ -86,26 +92,34 @@ def insert_report(media_id: str, title: str) -> bool:
             return False
 
 
+def _resolve_path(path_value: str) -> Path:
+    """将 path 字段值解析为绝对路径。相对路径以 PROJECT_DIR 为基准。"""
+    p = Path(path_value)
+    if p.is_absolute():
+        return p
+    return PROJECT_DIR / p
+
+
 def get_reports_to_download() -> list[dict[str, Any]]:
     """获取尚未下载的研报（仅限 48 小时内入库的），按插入时间从近到远排序。"""
     cutoff = int(time.time()) - 48 * 3600
     with sqlite3.connect(str(DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT media_id, title FROM reports "
+            "SELECT media_id, title, path FROM reports "
             "WHERE downloaded_ts = 0 AND created_ts > ? "
             "ORDER BY created_ts DESC",
             (cutoff,),
         ).fetchall()
-    return [{"media_id": r[0], "title": r[1]} for r in rows]
+    return [{"media_id": r[0], "title": r[1], "path": r[2]} for r in rows]
 
 
 def get_reports_to_send() -> list[dict[str, Any]]:
     """获取已下载但未发送的研报，按插入时间从近到远排序。"""
     with sqlite3.connect(str(DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT media_id, title FROM reports WHERE downloaded_ts > 0 AND sendmail_ts = 0 ORDER BY created_ts DESC"
+            "SELECT media_id, title, path FROM reports WHERE downloaded_ts > 0 AND sendmail_ts = 0 ORDER BY created_ts DESC"
         ).fetchall()
-    return [{"media_id": r[0], "title": r[1]} for r in rows]
+    return [{"media_id": r[0], "title": r[1], "path": r[2]} for r in rows]
 
 
 def mark_downloaded(media_id: str, ts: int | None = None) -> None:
@@ -209,8 +223,8 @@ def get_media_download_url(media_id: str) -> str | None:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def download_report(media_id: str, title: str) -> bool:
-    """下载研报到 downloaded_reports/ 目录。成功返回 True。"""
+def download_report(media_id: str, title: str, save_dir: Path) -> bool:
+    """下载研报到 save_dir 目录。成功返回 True。"""
     download_url = get_media_download_url(media_id)
     if not download_url:
         return False
@@ -219,8 +233,8 @@ def download_report(media_id: str, title: str) -> bool:
     separator = "&" if "?" in download_url else "?"
     dl = f"{download_url}{separator}response-content-type=application%2Foctet-stream&response-content-disposition=attachment%3Bfilename%3D%22{title}%22"
 
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = DOWNLOAD_DIR / title
+    save_dir.mkdir(parents=True, exist_ok=True)
+    filepath = save_dir / title
 
     try:
         with httpx.Client(timeout=120.0, follow_redirects=True) as client:
@@ -354,7 +368,7 @@ def download_and_send_new_reports() -> tuple[int, int]:
         print(f"[sendmail] 处理 {len(pending_sends)} 条已下载未发送的存量")
         for item in pending_sends:
             title = item["title"]
-            filepath = DOWNLOAD_DIR / title
+            filepath = _resolve_path(item["path"]) / title
             if not filepath.exists():
                 print(f"[sendmail] 文件不存在，跳过: {title}")
                 continue
@@ -374,16 +388,17 @@ def download_and_send_new_reports() -> tuple[int, int]:
     for item in to_download:
         media_id = item["media_id"]
         title = item["title"]
+        save_dir = _resolve_path(item["path"])
 
         # 下载
-        if not download_report(media_id, title):
+        if not download_report(media_id, title, save_dir):
             print(f"[download] ✗ 下载失败 ({title})，终止后续处理")
             break
         mark_downloaded(media_id)
         download_count += 1
 
         # 下载成功立即发送
-        filepath = DOWNLOAD_DIR / title
+        filepath = save_dir / title
         if send_email(title, filepath):
             mark_sent(media_id)
             sent_count += 1

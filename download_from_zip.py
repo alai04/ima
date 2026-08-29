@@ -29,9 +29,6 @@ def main() -> None:
         print(f"错误: 不是有效的 zip 文件 — {zip_path}")
         sys.exit(1)
 
-    out_dir = check_reports.DOWNLOAD_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     skipped_no_record = 0
     skipped_downloaded = 0
     extracted = 0
@@ -59,7 +56,7 @@ def main() -> None:
 
             with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
                 row = conn.execute(
-                    "SELECT media_id, title, downloaded_ts FROM reports WHERE title LIKE ?",
+                    "SELECT media_id, title, downloaded_ts, path FROM reports WHERE title LIKE ?",
                     (title_pattern,),
                 ).fetchone()
 
@@ -68,11 +65,15 @@ def main() -> None:
                 skipped_no_record += 1
                 continue
 
-            media_id, db_title, downloaded_ts = row
+            media_id, db_title, downloaded_ts, db_path = row
             if downloaded_ts > 0:
                 print("跳过（已下载）")
                 skipped_downloaded += 1
                 continue
+
+            # 用 DB 中的 path 字段指定保存目录
+            out_dir = check_reports._resolve_path(db_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
 
             # 直接读取 zip 内容写入目标文件（避免 zf.extract 创建深层路径导致 ENAMETOOLONG）
             dest = out_dir / db_title
