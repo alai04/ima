@@ -22,12 +22,21 @@
 7. 搜索阶段可通过 KEYWORD_IGNORE 环境变量过滤标题，逗号分隔多关键词，大小写不敏感。
 8. 研报的下载与发送路径均从数据库 path 字段动态读取（相对路径以项目目录为基准）。
 
+## 研报分类（LLM）
+对已下载的研报使用 DeepSeek LLM 进行两级分类，并将文件移动到分类目录：
+
+1. 仅处理 path 为缺省值（'downloaded_reports'）且已下载（downloaded_ts > 0）的研报。
+2. 一级分类四类：Equity Research、Macro & Strategy、Industry & Thematic、Others。
+3. 二级分类：Equity Research 按公司股票代码；Macro & Strategy 按地区；Industry & Thematic 按行业；Others 不再细分。
+4. 分类后按两级分类生成新路径 categorized_reports/{一级}/{二级}/，移动文件并更新 path 字段。
+
 ## 环境
 1. 知识库的API接口，参照 https://skillhub.cn/skills/ima-skills
 2. 调用API接口所需的 IMA_API_KEY, IMA_CLIENT_ID 保存在 .env 文件中。
 3. 邮件发送使用 O365 (Microsoft Graph API)，所需配置 O365_CLIENT_ID, O365_CLIENT_SECRET, O365_TENANT_ID 保存在 .env 文件中。
 4. 收件人 EMAIL_TO 保存在 .env 文件中。
 5. 未下载清单邮件的收件人 LIST_EMAIL_TO 保存在 .env 文件中。
+6. 研报分类所需的 DEEPSEEK_API_KEY 保存在 .env 文件中。
 
 ## 脚本文件
 
@@ -36,3 +45,4 @@
 | `check_reports.py` | 主脚本：搜索 → 入库 → 下载 → 发邮件 |
 | `list_undownloaded.py` | 辅助脚本：列出所有未下载研报并发送清单邮件 |
 | `download_from_zip.py` | 辅助脚本：从 zip 压缩包中提取 PDF 研报并标记为已下载 |
+| `categorize_reports.py` | 辅助脚本：使用 LLM 对已下载研报分类并移动至分类目录 |

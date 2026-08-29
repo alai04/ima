@@ -12,6 +12,7 @@ wheels/
 # Project data
 reports.db
 downloaded_reports/
+categorized_reports/
 *.zip
 *.log
 *.txt
