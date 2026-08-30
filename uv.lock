@@ -299,6 +299,7 @@ dependencies = [
     { name = "httpx" },
     { name = "o365" },
     { name = "pymupdf" },
+    { name = "requests" },
 ]
 
 [package.metadata]
@@ -307,6 +308,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "o365", specifier = ">=2.1.9" },
     { name = "pymupdf", specifier = ">=1.24.0" },
+    { name = "requests", specifier = ">=2.31.0" },
 ]
 
 [[package]]

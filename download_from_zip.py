@@ -15,6 +15,14 @@ import check_reports
 load_dotenv()
 
 
+def _fix_filename(name: str) -> str:
+    """还原被 cp437 误解码的 UTF-8 zip 文件名；无法还原时返回原名。"""
+    try:
+        return name.encode('cp437').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("用法: python download_from_zip.py <zip文件路径>")
@@ -45,7 +53,7 @@ def main() -> None:
         print(f"zip 中共 {len(pdf_members)} 个 PDF 文件\n")
 
         for info in pdf_members:
-            title = Path(info.filename).name.encode('cp437').decode('utf8')  # 去掉路径前缀，只取文件名，转换编码
+            title = Path(_fix_filename(info.filename)).name  # 去掉路径前缀，只取文件名，处理编码
             print(f"  → {title} ...", end=" ")
 
             # 查 DB（zip 内文件名可能被截断，对长文件名用 LIKE 模糊匹配）
