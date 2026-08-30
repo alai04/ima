@@ -5,7 +5,7 @@
   2. 阅读研报内容，用 LLM 输出两级分类
   3. 按分类生成新路径 categorized_reports/{一级}/{二级}/，移动文件并更新 path 字段
 
-用法: python categorize_reports.py [--dry-run] [--limit N]
+用法: python categorize_reports.py [--dry-run] [-n N]
 """
 
 import argparse
@@ -161,10 +161,12 @@ def sanitize_name(name: str) -> str:
 
 
 def get_default_reports() -> list[dict[str, Any]]:
-    """返回 path 为缺省值且已下载的记录。"""
+    """返回 path 为缺省值且已下载的记录，按创建时间从近到远排序。"""
     with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT media_id, title, path FROM reports WHERE path = ? AND downloaded_ts > 0",
+            "SELECT media_id, title, path FROM reports "
+            "WHERE path = ? AND downloaded_ts > 0 "
+            "ORDER BY created_ts DESC",
             (DEFAULT_PATH,),
         ).fetchall()
     return [{"media_id": r[0], "title": r[1], "path": r[2]} for r in rows]
@@ -212,7 +214,7 @@ def move_report(media_id: str, title: str, src_dir: Path, level1: str, level2: s
 def main() -> None:
     parser = argparse.ArgumentParser(description="使用 LLM 对研报进行分类")
     parser.add_argument("--dry-run", action="store_true", help="只打印分类结果，不移动文件")
-    parser.add_argument("--limit", type=int, default=0, help="最多处理 N 条（0 表示全部）")
+    parser.add_argument("-n", "--limit", type=int, default=0, help="最多处理 N 条（0 表示全部）")
     args = parser.parse_args()
 
     if not DEEPSEEK_API_KEY:

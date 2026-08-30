@@ -6,6 +6,8 @@
   3. 下载新增研报并立即邮件发送（下载失败则终止）
 """
 
+import argparse
+import html
 import os
 import sqlite3
 import time
@@ -25,6 +27,7 @@ IMA_CLIENT_ID = os.getenv("IMA_CLIENT_ID", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
 KEYWORD_IGNORE = os.getenv("KEYWORD_IGNORE", "")
+STATUS_EMAIL_TO = os.getenv("STATUS_EMAIL_TO", "")
 O365_CLIENT_ID = os.getenv("O365_CLIENT_ID", "")
 O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET", "")
 O365_TENANT_ID = os.getenv("O365_TENANT_ID", "common")
@@ -306,9 +309,140 @@ def send_email(title: str, filepath: Path) -> bool:
         return False
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Orchestrator
-# ═══════════════════════════════════════════════════════════════════════
+def _format_ts_range(ts_list: list[int]) -> str:
+    """格式化创建时间范围字符串（UTC）。"""
+    if not ts_list:
+        return "—"
+    fmt = lambda ts: datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    mn, mx = min(ts_list), max(ts_list)
+    if mn == mx:
+        return fmt(mn)
+    return f"{fmt(mn)} ~ {fmt(mx)}"
+
+
+def send_status_report() -> None:
+    """汇总研报下载/发送状态并发送邮件到 STATUS_EMAIL_TO。"""
+    if not STATUS_EMAIL_TO:
+        print("错误: 缺少 STATUS_EMAIL_TO 环境变量")
+        return
+
+    account = _get_account()
+    if not account:
+        return
+
+    if not EMAIL_FROM:
+        print("错误: 缺少 EMAIL_FROM 环境变量")
+        return
+
+    # ── 查询各状态数量与创建时间范围 ──
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        sections = []
+        queries = [
+            ("未下载", "downloaded_ts = 0"),
+            ("已下载未发送", "downloaded_ts > 0 AND sendmail_ts = 0"),
+            ("已下载未分类", "downloaded_ts > 0 AND path = 'downloaded_reports'"),
+            ("已发送", "sendmail_ts > 0"),
+        ]
+        for label, where in queries:
+            rows = conn.execute(f"SELECT created_ts FROM reports WHERE {where}").fetchall()
+            ts_list = [r[0] for r in rows if r[0] > 0]
+            sections.append({"label": label, "count": len(rows), "ts_list": ts_list})
+
+        total = conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        categorized_total = conn.execute(
+            "SELECT COUNT(*) FROM reports WHERE path LIKE 'categorized_reports/%'"
+        ).fetchone()[0]
+
+        # 已分类研报的一级分类分布
+        cat_rows = conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN path LIKE 'categorized_reports/Equity Research/%' THEN 'Equity Research'
+                    WHEN path LIKE 'categorized_reports/Macro & Strategy/%' THEN 'Macro & Strategy'
+                    WHEN path LIKE 'categorized_reports/Industry & Thematic/%' THEN 'Industry & Thematic'
+                    WHEN path LIKE 'categorized_reports/Others/%' THEN 'Others'
+                    ELSE 'Others'
+                END AS category, COUNT(*)
+            FROM reports
+            WHERE path LIKE 'categorized_reports/%'
+            GROUP BY category
+            ORDER BY COUNT(*) DESC
+            """
+        ).fetchall()
+
+        # 已下载研报（用于文件存在性检查）
+        downloaded_rows = conn.execute(
+            "SELECT title, path FROM reports WHERE downloaded_ts > 0 ORDER BY created_ts DESC"
+        ).fetchall()
+
+    # ── 检查已下载研报文件是否存在 ──
+    missing_files: list[dict[str, str]] = []
+    for title, path in downloaded_rows:
+        if not (_resolve_path(path) / title).exists():
+            missing_files.append({"title": title, "path": path})
+
+    # ── 构建 HTML ──
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    rows_html = "\n".join(
+        f"<tr>"
+        f"<td>{s['label']}</td>"
+        f"<td style='text-align:right'>{s['count']}</td>"
+        f"<td>{_format_ts_range(s['ts_list'])}</td>"
+        f"</tr>"
+        for s in sections
+    )
+
+    cat_html = ""
+    if cat_rows:
+        cat_items = "".join(f"<li>{c} — {n} 条</li>" for c, n in cat_rows)
+        cat_html = f"<h3>已分类研报分布</h3><ul>{cat_items}</ul>"
+
+    missing_html = ""
+    if missing_files:
+        missing_items = "".join(
+            f"<tr>"
+            f"<td>{html.escape(m['title'])}</td>"
+            f"<td>{html.escape(m['path'])}</td>"
+            f"</tr>"
+            for m in missing_files
+        )
+        missing_html = (
+            f"<h3>⚠️ 文件缺失异常（{len(missing_files)} 条）</h3>"
+            f"<p>以下已下载研报在文件系统中未找到对应文件：</p>"
+            f"<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse'>"
+            f"<thead><tr style='background:#fff0f0'>"
+            f"<th>研报标题</th><th>期望路径</th>"
+            f"</tr></thead>"
+            f"<tbody>{missing_items}</tbody>"
+            f"</table>"
+        )
+    else:
+        missing_html = "<p>✅ 已下载研报文件均存在，无异常。</p>"
+
+    html_body = (
+        f"<h2>研报状态汇总</h2>"
+        f"<p>统计时间：{now_str} (UTC)</p>"
+        f"<p>总计 {total} 条研报，其中已分类 {categorized_total} 条。</p>"
+        f"<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse'>"
+        f"<thead><tr style='background:#f5f5f5'>"
+        f"<th>状态</th><th>数量</th><th>创建时间范围 (UTC)</th>"
+        f"</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        f"</table>"
+        f"{cat_html}"
+        f"{missing_html}"
+    )
+
+    try:
+        m = account.new_message(resource=EMAIL_FROM)
+        m.to.add(STATUS_EMAIL_TO)
+        m.subject = f"研报状态汇总 ({now_str})"
+        m.body = html_body
+        m.send()
+        print(f"[status] ✓ 已发送至 {STATUS_EMAIL_TO}")
+    except Exception as e:
+        print(f"[status] ✗ 发送失败: {e}")
 
 
 def _should_ignore(title: str) -> bool:
@@ -408,6 +542,19 @@ def download_and_send_new_reports() -> tuple[int, int]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="IMA 研报自动下载与邮件分发 CLI")
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="汇总研报下载/发送状态并发送邮件，不执行下载/发送",
+    )
+    args = parser.parse_args()
+
+    if args.status:
+        init_db()
+        send_status_report()
+        return
+
     if not IMA_API_KEY or not IMA_CLIENT_ID:
         print("错误: 缺少 IMA_API_KEY / IMA_CLIENT_ID 环境变量")
         return
