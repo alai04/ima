@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from O365 import Account
+from requests.exceptions import HTTPError as RequestsHTTPError
 
 load_dotenv()
 
@@ -261,6 +262,11 @@ def download_report(media_id: str, title: str, save_dir: Path) -> bool:
 
 _account: Account | None = None
 
+# 邮件发送结果状态
+SEND_OK = "ok"
+SEND_CLIENT_ERROR = "client_error"  # 400 Client Error
+SEND_FAILED = "failed"              # 其它错误
+
 
 def _get_account() -> Account | None:
     """懒初始化 O365 Account，认证后全局复用。"""
@@ -284,16 +290,19 @@ def _get_account() -> Account | None:
         return None
 
 
-def send_email(title: str, filepath: Path) -> bool:
-    """通过 O365 发送带附件的邮件。成功返回 True。"""
+def send_email(title: str, filepath: Path) -> str:
+    """通过 O365 发送带附件的邮件。
+
+    返回 SEND_OK / SEND_CLIENT_ERROR / SEND_FAILED。
+    """
     if not EMAIL_FROM or not EMAIL_TO:
         print("[sendmail] 缺少 EMAIL_FROM / EMAIL_TO 配置，跳过")
-        return False
+        return SEND_FAILED
 
     account = _get_account()
     if not account:
         print("[sendmail] O365 未认证，跳过")
-        return False
+        return SEND_FAILED
 
     try:
         m = account.new_message(resource=EMAIL_FROM)
@@ -303,10 +312,17 @@ def send_email(title: str, filepath: Path) -> bool:
         m.attachments.add(str(filepath))
         m.send()
         print(f"[sendmail] ✓ {title}")
-        return True
+        return SEND_OK
+    except RequestsHTTPError as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code == 400:
+            print(f"[sendmail] 400 Client Error，跳过 ({title}): {e}")
+            return SEND_CLIENT_ERROR
+        print(f"[sendmail] 失败 ({title}): {e}")
+        return SEND_FAILED
     except Exception as e:
         print(f"[sendmail] 失败 ({title}): {e}")
-        return False
+        return SEND_FAILED
 
 
 def _format_ts_range(ts_list: list[int]) -> str:
@@ -506,11 +522,14 @@ def download_and_send_new_reports() -> tuple[int, int]:
             if not filepath.exists():
                 print(f"[sendmail] 文件不存在，跳过: {title}")
                 continue
-            if send_email(title, filepath):
+            result = send_email(title, filepath)
+            if result == SEND_OK:
                 mark_sent(item["media_id"])
                 sent_count += 1
+            elif result == SEND_CLIENT_ERROR:
+                continue  # 400 错误，继续处理下一条
             else:
-                break  # 发送失败，终止后续处理
+                break  # 其它发送错误，终止后续处理
 
     # ── Phase 2: 逐个下载并立即发送 ──
     to_download = get_reports_to_download()
@@ -533,7 +552,7 @@ def download_and_send_new_reports() -> tuple[int, int]:
 
         # 下载成功立即发送
         filepath = save_dir / title
-        if send_email(title, filepath):
+        if send_email(title, filepath) == SEND_OK:
             mark_sent(media_id)
             sent_count += 1
 
