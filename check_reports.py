@@ -556,11 +556,12 @@ def download_and_send_new_reports() -> tuple[int, int]:
             mark_sent(media_id)
             sent_count += 1
 
-    print(f"[summary] 本次下载 {download_count}，发送 {sent_count}")
+    print(f"[summary] 本次下载 {download_count}，发送 {sent_count}，完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return download_count, sent_count
 
 
 def main() -> None:
+    print(f"[start] 开始执行 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     parser = argparse.ArgumentParser(description="IMA 研报自动下载与邮件分发 CLI")
     parser.add_argument(
         "--status",
