@@ -500,12 +500,14 @@ def collect_reports() -> int:
     return new_count
 
 
-def download_and_send_new_reports() -> tuple[int, int]:
+def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
     """下载并发送研报。
 
     1. 先将之前已下载但未发送的研报发送出去
     2. 再逐个处理未下载的研报：下载 → 立即发送
        如果下载失败，立即退出不再继续。
+
+    send_only=True 时只执行第 1 步（发送已下载研报），跳过下载。
 
     返回 (downloaded_count, sent_count)。
     """
@@ -530,6 +532,10 @@ def download_and_send_new_reports() -> tuple[int, int]:
                 continue  # 400 错误，继续处理下一条
             else:
                 break  # 其它发送错误，终止后续处理
+
+    if send_only:
+        print(f"[summary] 仅发送模式，本次发送 {sent_count}，完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        return download_count, sent_count
 
     # ── Phase 2: 逐个下载并立即发送 ──
     to_download = get_reports_to_download()
@@ -568,11 +574,21 @@ def main() -> None:
         action="store_true",
         help="汇总研报下载/发送状态并发送邮件，不执行下载/发送",
     )
+    parser.add_argument(
+        "--sendonly",
+        action="store_true",
+        help="只发送已下载未发送的研报，不执行搜索和下载",
+    )
     args = parser.parse_args()
 
     if args.status:
         init_db()
         send_status_report()
+        return
+
+    if args.sendonly:
+        init_db()
+        download_and_send_new_reports(send_only=True)
         return
 
     if not IMA_API_KEY or not IMA_CLIENT_ID:
