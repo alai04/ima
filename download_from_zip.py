@@ -5,12 +5,15 @@
 
 import sqlite3
 import sys
+import time
 import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+import categorize_reports
 import check_reports
+from metadata import parse_author, parse_date
 
 load_dotenv()
 
@@ -93,8 +96,21 @@ def main() -> None:
                 continue
 
             check_reports.mark_downloaded(media_id)
-            print("✓")
+
+            # 分类并写 DB（复用 categorize_reports 的 LLM 分类）
+            author = parse_author(db_title)
+            report_date = parse_date(db_title)
+            text = categorize_reports.extract_text(dest)
+            result = categorize_reports.classify_report(db_title, text)
+            if result is not None:
+                level1, level2, priority = result
+                categorize_reports.update_metadata(media_id, author, report_date, level1, level2, priority)
+                label = f"{level1}" + (f"/{level2}" if level2 else "")
+                print(f"✓ 分类: {label} ({priority})")
+            else:
+                print("✓（分类失败，仅标记下载）")
             extracted += 1
+            time.sleep(0.2)  # 温和限速
 
     print(f"\n—— 完成 ——")
     print(f"  解压并标记: {extracted}")

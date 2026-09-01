@@ -44,5 +44,5 @@
 |------|------|
 | `check_reports.py` | 主脚本：搜索 → 入库 → 下载 → 发邮件 |
 | `list_undownloaded.py` | 辅助脚本：列出所有未下载研报并发送清单邮件 |
-| `download_from_zip.py` | 辅助脚本：从 zip 压缩包中提取 PDF 研报并标记为已下载 |
+| `download_from_zip.py` | 辅助脚本：从 zip 压缩包中提取 PDF 研报、标记已下载、分类并写入元数据 |
 | `categorize_reports.py` | 辅助脚本：使用 LLM 对已下载研报分类并移动至分类目录 |
