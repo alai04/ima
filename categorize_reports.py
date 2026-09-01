@@ -35,9 +35,65 @@ CATEGORIZED_ROOT = check_reports.PROJECT_DIR / "categorized_reports"
 DEFAULT_PATH = "downloaded_reports"
 
 LEVEL1_CATEGORIES = ["Equity Research", "Macro & Strategy", "Industry & Thematic", "Others"]
+PRIORITY_CATEGORIES = ["High", "Medium", "Low"]
 
 # 每次分类抽取的最大字符数（首页通常含标题/公司/摘要）
 MAX_TEXT_CHARS = 6000
+
+
+# ── 券商中英文映射表（可扩展，未命中保留原文） ─────────────────────────
+BROKER_NAME_MAP: dict[str, str] = {
+    "高盛": "Goldman Sachs",
+    "伯恩斯坦": "Bernstein",
+    "摩根士丹利": "Morgan Stanley",
+    "摩根大通": "J.P. Morgan",
+    "美银": "BofA Securities",
+    "美银美林": "BofA Securities",
+    "美国银行": "BofA Securities",
+    "花旗": "Citi",
+    "瑞银": "UBS",
+    "瑞信": "Credit Suisse",
+    "巴克莱": "Barclays",
+    "德意志银行": "Deutsche Bank",
+    "汇丰": "HSBC",
+    "野村": "Nomura",
+    "大和": "Daiwa",
+    "杰富瑞": "Jefferies",
+    "麦格理": "Macquarie",
+    "里昂": "CLSA",
+    "中金": "CICC",
+    "中信证券": "CITIC Securities",
+    "华泰证券": "Huatai Securities",
+    "国泰君安": "Guotai Junan",
+    "申万宏源": "Shenwan Hongyuan",
+    "海通证券": "Haitong Securities",
+    "广发证券": "GF Securities",
+    "招商证券": "China Merchants Securities",
+}
+
+
+def parse_author(title: str) -> str:
+    """从文件名前缀解析中文券商名并映射为英文。未命中保留原文并告警。"""
+    m = re.match(r"^([^-—]+)[-—]", title)
+    if not m:
+        return ""
+    zh = m.group(1).strip()
+    en = BROKER_NAME_MAP.get(zh)
+    if en is None:
+        print(f"[meta] 券商名未命中映射表，保留原文待补充: {zh}")
+        return zh
+    return en
+
+
+def parse_date(title: str) -> str:
+    """从文件名末尾 -yymmdd 解析撰写日期，返回 'YYYY-MM-DD'；无则返回空串。"""
+    m = re.search(r"-(\d{6})\.pdf$", title, re.IGNORECASE)
+    if not m:
+        return ""
+    yy, mm, dd = m.group(1)[:2], m.group(1)[2:4], m.group(1)[4:6]
+    if not (1 <= int(mm) <= 12 and 1 <= int(dd) <= 31):
+        return ""
+    return f"20{yy}-{mm}-{dd}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -76,13 +132,19 @@ _SYSTEM_PROMPT = """你是一名卖方研究（sell-side research）研报分类
 - Industry & Thematic：输出行业英文名（如 "Semiconductors"、"Energy Storage"、"Software"、"Autos"、"Biotech"）
 - Others：输出空字符串 ""
 
+额外判断优先级 priority，只能是以下三档之一：
+- "High"：评级/目标价变动、首次覆盖、业绩大幅超/低于预期、重大宏观事件
+- "Medium"：常规业绩点评、行业/策略例行更新
+- "Low"：数据更新、例行周报、会议纪要
+无法判断时输出 "Medium"。
+
 只输出 JSON，格式：
-{"level1": "...", "level2": "..."}
+{"level1": "...", "level2": "...", "priority": "..."}
 不要输出任何其他文字。"""
 
 
-def classify_report(title: str, text: str) -> tuple[str, str] | None:
-    """调用 DeepSeek 分类，返回 (level1, level2)；失败返回 None。"""
+def classify_report(title: str, text: str) -> tuple[str, str, str] | None:
+    """调用 DeepSeek 分类，返回 (level1, level2, priority)；失败返回 None。"""
     if not DEEPSEEK_API_KEY:
         print("[classify] 缺少 DEEPSEEK_API_KEY，跳过")
         return None
@@ -133,10 +195,15 @@ def classify_report(title: str, text: str) -> tuple[str, str] | None:
 
     level1 = result.get("level1", "").strip()
     level2 = result.get("level2", "").strip()
+    priority = result.get("priority", "").strip() or "Medium"
 
     if level1 not in LEVEL1_CATEGORIES:
         print(f"[classify] 非法一级分类 ({title}): {level1}")
         return None
+
+    if priority not in PRIORITY_CATEGORIES:
+        print(f"[classify] 非法优先级 ({title}): {priority}，回退 Medium")
+        priority = "Medium"
 
     if level1 == "Others":
         level2 = ""
@@ -144,7 +211,7 @@ def classify_report(title: str, text: str) -> tuple[str, str] | None:
         print(f"[classify] 缺少二级分类 ({title}): {level1}")
         return None
 
-    return level1, level2
+    return level1, level2, priority
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -176,6 +243,17 @@ def update_path(media_id: str, new_path: str) -> None:
     """更新记录的 path 字段。"""
     with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
         conn.execute("UPDATE reports SET path = ? WHERE media_id = ?", (new_path, media_id))
+        conn.commit()
+
+
+def update_metadata(media_id: str, author: str, report_date: str, level1: str, level2: str, priority: str) -> None:
+    """落库元数据字段（撰写方/撰写日期/一级分类/二级分类/优先级）。"""
+    with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE reports SET author = ?, report_date = ?, level1 = ?, level2 = ?, priority = ? "
+            "WHERE media_id = ?",
+            (author, report_date, level1, level2, priority, media_id),
+        )
         conn.commit()
 
 
@@ -252,6 +330,10 @@ def main() -> None:
         if not text.strip():
             print("  ⚠ 无文本层，仅凭文件名分类")
 
+        # 解析撰写方与撰写日期（确定性，零成本）
+        author = parse_author(title)
+        report_date = parse_date(title)
+
         # LLM 分类
         result = classify_report(title, text)
         if result is None:
@@ -259,13 +341,17 @@ def main() -> None:
             failed += 1
             continue
 
-        level1, level2 = result
-        label = f"{level1}" + (f" / {level2}" if level2 else "")
-        print(f"  → {label}")
+        level1, level2, priority = result
+        label = f"{level1}" + (f" / {level2}" if level2 else "") + f" ({priority})"
+        meta = f"[{author or '?'} | {report_date or '?'}]"
+        print(f"  → {label} {meta}")
 
         if args.dry_run:
             classified += 1
             continue
+
+        # 落库元数据（分类 + 撰写方/日期/优先级）
+        update_metadata(media_id, author, report_date, level1, level2, priority)
 
         # 移动文件
         new_rel_path = move_report(media_id, title, src_dir, level1, level2)

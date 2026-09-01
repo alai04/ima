@@ -72,6 +72,15 @@ def init_db() -> None:
         migrations = [
             ("created_ts", "INTEGER DEFAULT 0"),
             ("path", "TEXT DEFAULT 'downloaded_reports'"),
+            ("author", "TEXT DEFAULT ''"),
+            ("report_date", "TEXT DEFAULT ''"),
+            ("level1", "TEXT DEFAULT ''"),
+            ("level2", "TEXT DEFAULT ''"),
+            ("priority", "TEXT DEFAULT 'Medium'"),
+            ("source_kb", "TEXT DEFAULT '环球研报直通车'"),
+            ("sharepoint_ts", "INTEGER DEFAULT 0"),
+            ("sharepoint_item_id", "TEXT DEFAULT ''"),
+            ("sharepoint_url", "TEXT DEFAULT ''"),
         ]
         for column, definition in migrations:
             try:
