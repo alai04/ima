@@ -133,13 +133,11 @@ def main() -> None:
     for i, item in enumerate(reports, start=1):
         media_id = item["media_id"]
         title = item["title"]
-        level1 = item["level1"]
         fields = build_fields(item)
 
         print(f"[{i}/{len(reports)}] {title}")
 
         if args.dry_run:
-            print(f"  → 文件夹: {level1}")
             print(f"  → 字段: {fields}")
             uploaded += 1
             continue
@@ -171,7 +169,7 @@ def main() -> None:
                 failed += 1
                 continue
 
-            result = sharepoint.upload_file(level1, title, src_file.read_bytes())
+            result = sharepoint.upload_file(title, src_file.read_bytes())
             drive_item_id = result.get("id", "")
             web_url = result.get("webUrl", "")
             if not drive_item_id:
@@ -182,7 +180,7 @@ def main() -> None:
             record_item_id(media_id, drive_item_id, web_url)
             sharepoint.set_fields(drive_item_id, fields)
             mark_uploaded(media_id)
-            print(f"  ✓ 已上传 → {level1}/")
+            print("  ✓ 已上传")
             uploaded += 1
 
         except sharepoint.SharePointError as e:

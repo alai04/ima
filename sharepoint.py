@@ -216,16 +216,15 @@ def resolve_list() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _target_path(folder: str, filename: str) -> str:
+def _target_path(filename: str) -> str:
     """构造 Graph 的 root: 路径引用（含冒号，整体 URL 编码）。"""
-    folder_part = f"{folder.strip('/')}/" if folder.strip("/") else ""
-    return quote(f"root:/{folder_part}{filename}:", safe="")
+    return quote(f"root:/{filename}:", safe="")
 
 
-def _simple_upload(folder: str, filename: str, data: bytes) -> dict[str, Any]:
+def _simple_upload(filename: str, data: bytes) -> dict[str, Any]:
     site_id = resolve_site()
     drive_id = resolve_drive()
-    target = _target_path(folder, filename)
+    target = _target_path(filename)
     url = f"{GRAPH_BASE}/sites/{site_id}/drives/{drive_id}/{target}/content"
 
     headers = _auth_headers()
@@ -241,11 +240,11 @@ def _simple_upload(folder: str, filename: str, data: bytes) -> dict[str, Any]:
             return resp.json()
 
 
-def _session_upload(folder: str, filename: str, data: bytes) -> dict[str, Any]:
+def _session_upload(filename: str, data: bytes) -> dict[str, Any]:
     """大文件（>250MB）走 createUploadSession 分片上传。"""
     site_id = resolve_site()
     drive_id = resolve_drive()
-    target = _target_path(folder, filename)
+    target = _target_path(filename)
     create_url = f"{GRAPH_BASE}/sites/{site_id}/drives/{drive_id}/{target}/createUploadSession"
 
     body = {"item": {"@microsoft.graph.conflictBehavior": "replace"}}
@@ -273,11 +272,11 @@ def _session_upload(folder: str, filename: str, data: bytes) -> dict[str, Any]:
     raise SharePointError(f"上传会话未完成: {filename}")
 
 
-def upload_file(folder: str, filename: str, data: bytes) -> dict[str, Any]:
-    """上传文件到文档库的 folder 目录。返回 driveItem（含 id 与 webUrl）。"""
+def upload_file(filename: str, data: bytes) -> dict[str, Any]:
+    """上传文件到文档库根目录。返回 driveItem（含 id 与 webUrl）。"""
     if len(data) <= SIMPLE_UPLOAD_LIMIT:
-        return _simple_upload(folder, filename, data)
-    return _session_upload(folder, filename, data)
+        return _simple_upload(filename, data)
+    return _session_upload(filename, data)
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -90,9 +90,9 @@ categorized_reports/{一级}/{二级}/
 | Site 名称 | `Research Reports`（或团队自定义） |
 | Site 路径 | `/sites/ResearchReports` |
 | 文档库 | 默认 `Documents`，建议重命名为「研报库」并保留库名英文，例如 `Research Library` |
-| 目录结构 | **按一级分类建 4 个文件夹**：`Equity Research` / `Macro & Strategy` / `Industry & Thematic` / `Others`（与本地 `categorized_reports` 一致）；其余维度一律用列承载，不再加深目录 |
+| 目录结构 | **不分文件夹**，所有研报直接平铺上传至文档库根目录；全部分类/券商/日期/优先级用列承载 |
 
-> 为什么「一级分类用文件夹、其余用列」：文件夹对用户直观，但 SharePoint 最佳实践是「元数据优于文件夹」。折中方案——只按一级分类分文件夹（数量固定为 4、不会失控），二级分类 / 券商 / 日期 / 优先级全部用列，配合视图筛选。
+> 采用「纯元数据」方案：所有研报平铺在文档库根目录，分类 / 券商 / 日期 / 优先级全部用列承载，靠视图与搜索筛选。这符合 SharePoint「元数据优于文件夹」的最佳实践，也避免了浏览时多进一层目录。
 
 ### 3.2 元数据列（文档库自定义列）
 
@@ -295,7 +295,7 @@ def parse_date(title: str) -> str | None:
 查询 reports 表：downloaded_ts > 0 AND sharepoint_ts = 0 AND level1 != ''
    （只上传已分类、已下载、未上传的研报，按 created_ts DESC）
    │
-   ├─ 1. 解析远端定位：get_site_id() → get_drive_id("Research Library") → 目标文件夹 = level1
+   ├─ 1. 解析远端定位：get_site_id() → get_drive_id("Research Library")
    ├─ 2. 幂等检查：远端是否已存在同名文件？已存在且 MediaId 匹配 → 标记跳过
    ├─ 3. 上传：≤250MB 简单 PUT；>250MB createUploadSession 分片
    ├─ 4. 写元数据：PATCH .../items/{itemId}/listItem/fields
@@ -321,7 +321,7 @@ GET https://graph.microsoft.com/v1.0/sites/{site-id}/drives
 **（3）上传文件（≤250MB，简单 PUT）**
 
 ```http
-PUT https://graph.microsoft.com/v1.0/sites/{site-id}/drives/{drive-id}/root:/{level1}/{filename}:/content
+PUT https://graph.microsoft.com/v1.0/sites/{site-id}/drives/{drive-id}/root:/{filename}:/content
 Content-Type: application/pdf
 # Body = PDF 二进制
 ```
@@ -332,7 +332,7 @@ Content-Type: application/pdf
 **（4）上传大文件（>250MB，上传会话）**
 
 ```http
-POST https://graph.microsoft.com/v1.0/sites/{site-id}/drives/{drive-id}/root:/{level1}/{filename}:/createUploadSession
+POST https://graph.microsoft.com/v1.0/sites/{site-id}/drives/{drive-id}/root:/{filename}:/createUploadSession
 Content-Type: application/json
 { "item": { "@microsoft.graph.conflictBehavior": "replace" } }
 # 返回 uploadUrl，按字节范围 PUT 分片上传
@@ -399,7 +399,7 @@ ima/
 | `graph_get(path)` / `graph_patch(path, body)` / `graph_put_binary(path, data)` | 带 Authorization 头的 httpx 封装，统一 429 退避与错误分类 |
 | `resolve_site(site_path)` | 返回 site id（含内存缓存） |
 | `resolve_drive(site_id, drive_name)` | 返回 drive id（含缓存） |
-| `upload_file(site_id, drive_id, folder, filename, data)` | ≤250MB 简单 PUT；返回 itemId/webUrl |
+| `upload_file(site_id, drive_id, filename, data)` | ≤250MB 简单 PUT；返回 itemId/webUrl |
 | `upload_file_large(...)` | createUploadSession 分片 |
 | `set_fields(site_id, drive_id, item_id, fields)` | PATCH listItem/fields |
 | `find_by_media_id(site_id, drive_id, media_id)` | 幂等查询 |
@@ -493,8 +493,8 @@ check_reports（搜索→下载） → categorize_reports（元数据抽取） �
 | 解析站点 | `GET /sites/{tenant}.sharepoint.com:/sites/{path}` 或 `GET /sites?search={name}` |
 | 列文档库 | `GET /sites/{site-id}/drives` |
 | 列列表 | `GET /sites/{site-id}/lists`（文档库即 list） |
-| 上传（≤250MB） | `PUT /sites/{site-id}/drives/{drive-id}/root:/{folder}/{name}:/content` |
-| 上传（大文件） | `POST /sites/{site-id}/drives/{drive-id}/root:/{folder}/{name}:/createUploadSession` |
+| 上传（≤250MB） | `PUT /sites/{site-id}/drives/{drive-id}/root:/{name}:/content` |
+| 上传（大文件） | `POST /sites/{site-id}/drives/{drive-id}/root:/{name}:/createUploadSession` |
 | 写元数据 | `PATCH /sites/{site-id}/drives/{drive-id}/items/{itemId}/listItem/fields` |
 | 建列 | `POST /sites/{site-id}/lists/{list-id}/columns` |
 | 幂等查询 | `GET /sites/{site-id}/lists/{list-id}/items?expand=fields&filter=fields/MediaId eq '{id}'` |
