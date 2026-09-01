@@ -3,7 +3,7 @@
 流程：
   1. 查询 reports 表中已下载、已分类（level1 非空）的研报
   2. 幂等检查（远端 MediaId 是否已存在）
-  3. 上传 PDF 到文档库 {level1} 文件夹
+  3. 上传 PDF 到文档库根目录
   4. PATCH listItem/fields 写元数据
   5. 回写 DB：sharepoint_item_id / sharepoint_url / sharepoint_ts
 
@@ -25,9 +25,7 @@ from typing import Any
 
 import check_reports
 import sharepoint
-
-SOURCE_KB_DEFAULT = "环球研报直通车"
-PRIORITY_DEFAULT = "Medium"
+from metadata import build_fields
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -73,29 +71,6 @@ def mark_uploaded(media_id: str, ts: int | None = None) -> None:
     with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
         conn.execute("UPDATE reports SET sharepoint_ts = ? WHERE media_id = ?", (ts, media_id))
         conn.commit()
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 元数据字段构建
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def build_fields(item: dict[str, Any]) -> dict[str, Any]:
-    """从 DB 记录构建 SharePoint 元数据字段。空值省略，避免覆盖远端已有值。"""
-    fields: dict[str, Any] = {
-        "Title": item["title"],
-        "Category1": item["level1"],
-        "MediaId": item["media_id"],
-        "SourceKB": item["source_kb"] or SOURCE_KB_DEFAULT,
-        "Priority": item["priority"] or PRIORITY_DEFAULT,
-    }
-    if item["level2"]:
-        fields["Category2"] = item["level2"]
-    if item["author"]:
-        fields["ReportAuthor"] = item["author"]
-    if item["report_date"]:
-        fields["ReportDate"] = f"{item['report_date']}T00:00:00Z"
-    return fields
 
 
 # ═══════════════════════════════════════════════════════════════════════

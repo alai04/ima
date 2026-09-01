@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 from O365 import Account
 from requests.exceptions import HTTPError as RequestsHTTPError
 
+import sharepoint
+from metadata import build_fields, parse_author, parse_date
+
 load_dotenv()
 
 # ── 环境变量 ──────────────────────────────────────────────────────────
@@ -32,6 +35,10 @@ STATUS_EMAIL_TO = os.getenv("STATUS_EMAIL_TO", "")
 O365_CLIENT_ID = os.getenv("O365_CLIENT_ID", "")
 O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET", "")
 O365_TENANT_ID = os.getenv("O365_TENANT_ID", "common")
+UPLOAD_TO_SHAREPOINT = os.getenv("UPLOAD_TO_SHAREPOINT", "false").strip().lower() in ("1", "true", "yes", "on")
+SEND_MODE = os.getenv("SEND_MODE", "digest").strip().lower()
+if SEND_MODE not in ("attachment", "digest"):
+    SEND_MODE = "digest"
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
 ROOT_KB_NAME = "环球研报直通车"
 ROOT_KB_ID = ""
@@ -334,6 +341,122 @@ def send_email(title: str, filepath: Path) -> str:
         return SEND_FAILED
 
 
+def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bool:
+    """上传单个研报到 SharePoint 并写元数据（幂等）。
+
+    元数据优先取 DB（可能已由 categorize 填充），author/report_date 缺失时
+    从文件名即时解析。分类字段（level1/level2）为空则省略，由后续
+    categorize + upload_to_sharepoint 补齐。
+
+    返回是否上传成功（已上传视为成功）。
+    """
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT author, report_date, level1, level2, priority, source_kb, "
+            "sharepoint_ts, sharepoint_item_id FROM reports WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+
+    if row is None:
+        print(f"[upload] 未找到记录: {media_id}")
+        return False
+
+    author, report_date, level1, level2, priority, source_kb, sp_ts, sp_item_id = row
+
+    if sp_ts > 0:
+        return True  # 已上传
+
+    # 补齐可从文件名解析的元数据
+    if not author:
+        author = parse_author(title)
+    if not report_date:
+        report_date = parse_date(title)
+
+    item = {
+        "media_id": media_id,
+        "title": title,
+        "author": author,
+        "report_date": report_date,
+        "level1": level1,
+        "level2": level2,
+        "priority": priority,
+        "source_kb": source_kb,
+    }
+    fields = build_fields(item)
+
+    try:
+        if sp_item_id:
+            # 文件已在远端（上次上传成功但元数据未写完），仅补写字段
+            sharepoint.set_fields(sp_item_id, fields)
+        else:
+            result = sharepoint.upload_file(title, filepath.read_bytes())
+            drive_item_id = result.get("id", "")
+            web_url = result.get("webUrl", "")
+            if not drive_item_id:
+                print(f"[upload] 上传响应缺少 id: {result}")
+                return False
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                conn.execute(
+                    "UPDATE reports SET sharepoint_item_id = ?, sharepoint_url = ? WHERE media_id = ?",
+                    (drive_item_id, web_url, media_id),
+                )
+                conn.commit()
+            sharepoint.set_fields(drive_item_id, fields)
+    except sharepoint.SharePointError as e:
+        print(f"[upload] SharePoint 错误 ({title}): {e}")
+        return False
+    except Exception as e:
+        print(f"[upload] 失败 ({title}): {e}")
+        return False
+
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.execute("UPDATE reports SET sharepoint_ts = ? WHERE media_id = ?", (int(time.time()), media_id))
+        conn.commit()
+
+    print(f"[upload] ✓ {title}")
+    return True
+
+
+def send_digest_email(reports: list[dict[str, Any]]) -> bool:
+    """发送最新研报清单邮件（含 SharePoint 站点链接）。返回是否发送成功。"""
+    if not reports:
+        return True
+
+    if not EMAIL_FROM or not EMAIL_TO:
+        print("[digest] 缺少 EMAIL_FROM / EMAIL_TO 配置，跳过")
+        return False
+
+    account = _get_account()
+    if not account:
+        print("[digest] O365 未认证，跳过")
+        return False
+
+    items_html = "".join(f"<li>{html.escape(r['title'])}</li>" for r in reports)
+
+    site_link = sharepoint.site_url()
+    link_html = ""
+    if site_link:
+        link_html = f'<p>📎 <a href="{site_link}">{site_link}</a></p>'
+
+    body = (
+        f"<p>最新研报 {len(reports)} 条：</p>"
+        f"<ul>{items_html}</ul>"
+        f"{link_html}"
+    )
+
+    try:
+        m = account.new_message(resource=EMAIL_FROM)
+        m.to.add(EMAIL_TO)
+        m.subject = f"环球研报: 最新 {len(reports)} 条"
+        m.body = body
+        m.send()
+        print(f"[digest] ✓ 已发送清单邮件（{len(reports)} 条）")
+        return True
+    except Exception as e:
+        print(f"[digest] 发送失败: {e}")
+        return False
+
+
 def _format_ts_range(ts_list: list[int]) -> str:
     """格式化创建时间范围字符串（UTC）。"""
     if not ts_list:
@@ -510,20 +633,25 @@ def collect_reports() -> int:
 
 
 def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
-    """下载并发送研报。
+    """下载、（可选）上传、发送研报。
 
-    1. 先将之前已下载但未发送的研报发送出去
-    2. 再逐个处理未下载的研报：下载 → 立即发送
-       如果下载失败，立即退出不再继续。
+    - UPLOAD_TO_SHAREPOINT=True 时，已下载研报在发送邮件前先上传 SharePoint。
+    - SEND_MODE="attachment"：逐封附件发送；
+      SEND_MODE="digest"：汇总为一份清单邮件（含 SharePoint 站点链接）。
 
-    send_only=True 时只执行第 1 步（发送已下载研报），跳过下载。
+    send_only=True 时只处理已下载未发送的存量，跳过下载。
 
     返回 (downloaded_count, sent_count)。
     """
     download_count = 0
     sent_count = 0
+    digest_items: list[dict[str, Any]] = []  # digest 模式累积的研报
 
-    # ── Phase 1: 发送已下载但未发送的存量 ──
+    def _maybe_upload(item: dict[str, Any], filepath: Path) -> None:
+        if UPLOAD_TO_SHAREPOINT:
+            upload_report_to_sharepoint(item["media_id"], item["title"], filepath)
+
+    # ── Phase 1: 已下载未发送的存量 ──
     pending_sends = get_reports_to_send()
     if pending_sends:
         print(f"[sendmail] 处理 {len(pending_sends)} 条已下载未发送的存量")
@@ -533,43 +661,56 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
             if not filepath.exists():
                 print(f"[sendmail] 文件不存在，跳过: {title}")
                 continue
-            result = send_email(title, filepath)
-            if result == SEND_OK:
-                mark_sent(item["media_id"])
-                sent_count += 1
-            elif result == SEND_CLIENT_ERROR:
-                continue  # 400 错误，继续处理下一条
+
+            _maybe_upload(item, filepath)
+
+            if SEND_MODE == "attachment":
+                result = send_email(title, filepath)
+                if result == SEND_OK:
+                    mark_sent(item["media_id"])
+                    sent_count += 1
+                elif result == SEND_CLIENT_ERROR:
+                    continue  # 400 错误，继续处理下一条
+                else:
+                    break  # 其它发送错误，终止后续处理
             else:
-                break  # 其它发送错误，终止后续处理
+                digest_items.append(item)
 
-    if send_only:
-        print(f"[summary] 仅发送模式，本次发送 {sent_count}，完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return download_count, sent_count
+    # ── Phase 2: 逐个下载并处理 ──
+    if not send_only:
+        to_download = get_reports_to_download()
+        if to_download:
+            print(f"[download] 开始处理 {len(to_download)} 条新研报...")
+            for item in to_download:
+                media_id = item["media_id"]
+                title = item["title"]
+                save_dir = _resolve_path(item["path"])
 
-    # ── Phase 2: 逐个下载并立即发送 ──
-    to_download = get_reports_to_download()
-    if not to_download:
-        print("[download] 没有需要下载的新研报")
-        return download_count, sent_count
+                # 下载
+                if not download_report(media_id, title, save_dir):
+                    print(f"[download] ✗ 下载失败 ({title})，终止后续处理")
+                    break
+                mark_downloaded(media_id)
+                download_count += 1
 
-    print(f"[download] 开始处理 {len(to_download)} 条新研报...")
-    for item in to_download:
-        media_id = item["media_id"]
-        title = item["title"]
-        save_dir = _resolve_path(item["path"])
+                filepath = save_dir / title
+                _maybe_upload(item, filepath)
 
-        # 下载
-        if not download_report(media_id, title, save_dir):
-            print(f"[download] ✗ 下载失败 ({title})，终止后续处理")
-            break
-        mark_downloaded(media_id)
-        download_count += 1
+                if SEND_MODE == "attachment":
+                    if send_email(title, filepath) == SEND_OK:
+                        mark_sent(media_id)
+                        sent_count += 1
+                else:
+                    digest_items.append(item)
+        else:
+            print("[download] 没有需要下载的新研报")
 
-        # 下载成功立即发送
-        filepath = save_dir / title
-        if send_email(title, filepath) == SEND_OK:
-            mark_sent(media_id)
-            sent_count += 1
+    # ── digest 模式：统一发送清单 ──
+    if SEND_MODE == "digest" and digest_items:
+        if send_digest_email(digest_items):
+            for item in digest_items:
+                mark_sent(item["media_id"])
+            sent_count += len(digest_items)
 
     print(f"[summary] 本次下载 {download_count}，发送 {sent_count}，完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return download_count, sent_count

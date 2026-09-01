@@ -380,10 +380,11 @@ Content-Type: application/json
 
 ```
 ima/
-├── check_reports.py            # 现有：搜索/下载/发信（init_db 增加字段迁移）
+├── check_reports.py            # 现有：搜索/下载/发信（可选内联上传 SharePoint + 清单邮件）
 ├── categorize_reports.py       # 改造：LLM 输出扩展为 {level1,level2,priority}，元数据落库
+├── metadata.py                 # 新增：券商映射 / 文件名解析 / SharePoint 字段构建（共享）
 ├── backfill_metadata.py        # 新增：历史已分类研报从 path 反推并回填元数据
-├── sharepoint.py               # 新增：Graph 认证 + 上传 + 元数据写入的封装
+├── sharepoint.py               # 新增：Graph 认证 + 上传 + 元数据写入 + site_url 的封装
 ├── upload_to_sharepoint.py     # 新增：上传 CLI（读 DB → 上传 → 写字段 → 回写）
 └── docs/
     └── sharepoint-team-site-plan.md   # 本文档
@@ -429,8 +430,14 @@ PYTHONPATH=src .venv/bin/python upload_to_sharepoint.py --force
 SHAREPOINT_TENANT=your-tenant          # {tenant}.sharepoint.com 的 {tenant}
 SHAREPOINT_SITE_PATH=/sites/ResearchReports
 SHAREPOINT_DRIVE_NAME=Research Library
-# 可选：上传模式开关（false 时上传脚本静默跳过，方便分阶段上线）
+# 上传脚本 upload_to_sharepoint.py 的开关（false 时静默跳过）
 SHAREPOINT_ENABLED=true
+
+# check_reports.py：下载后、发邮件前是否自动上传 SharePoint（缺省 false）
+UPLOAD_TO_SHAREPOINT=false
+
+# check_reports.py：邮件发送方式 attachment=附件逐个 / digest=清单汇总（缺省 digest）
+SEND_MODE=digest
 ```
 
 ---
@@ -440,18 +447,23 @@ SHAREPOINT_ENABLED=true
 1. **搜索**：SharePoint 顶部搜索框输入关键词即可命中标题与正文（文档库列默认进索引）；高级搜索可用 KQL：`ReportAuthor:高盛 Priority:High`。
 2. **筛选**：文档库页面右侧筛选窗格按 `Category1` / `Priority` / `ReportAuthor` / `ReportDate` 组合筛选。
 3. **阅读**：点击文件在线预览（PDF 浏览器内置预览），或下载。
-4. **提醒**（可选）：保留邮件分发作为「新研报提醒」，邮件正文附 SharePoint 文件 `sharepoint_url` 直链，引导成员回站点检索。
+4. **提醒**：`check_reports.py` 在 `SEND_MODE=digest` 下发送「最新研报清单」邮件，正文附 SharePoint 站点链接（`https://{tenant}.sharepoint.com{site_path}`），成员一键跳转检索；`SEND_MODE=attachment` 下则逐封发送附件。
 
 ---
 
 ## 10. 定时调度
 
-沿用现有方式，在下载流水线末尾追加上传步骤，形成单一 cron：
+调度链（cron 顺序执行）：
 
 ```
-check_reports（搜索→下载） → categorize_reports（元数据抽取） → upload_to_sharepoint（上传）
+check_reports（搜索→下载→[可选上传]→发送邮件）
+   → categorize_reports（LLM 分类 + 元数据落库）
+   → upload_to_sharepoint（补传/补写元数据）
 ```
 
+- `check_reports.py` 现在可配置：
+  - `UPLOAD_TO_SHAREPOINT=true` 时，下载后、发邮件前自动上传 SharePoint；
+  - `SEND_MODE=digest`（缺省）时汇总为一份清单邮件（含站点链接），`attachment` 时逐封发附件。
 - 建议调度：**每个交易日早间一次**（覆盖前一日与隔夜研报）。
 - 三个脚本独立、幂等，任一环节失败不影响其它；cron 按顺序执行并保留各自退出码。
 
