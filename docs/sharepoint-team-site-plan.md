@@ -516,14 +516,14 @@ check_reports（搜索→下载） → categorize_reports（元数据抽取） �
 |--------|--------|
 | 高盛 | Goldman Sachs |
 | 伯恩斯坦 | Bernstein |
-| 摩根士丹利 | Morgan Stanley |
+| 摩根士丹利 / 大摩 | Morgan Stanley |
 | 摩根大通 | J.P. Morgan |
 | 美银 / 美银美林 / 美国银行 | BofA Securities |
 | 花旗 | Citi |
 | 瑞银 | UBS |
 | 瑞信 | Credit Suisse |
 | 巴克莱 | Barclays |
-| 德意志银行 | Deutsche Bank |
+| 德意志银行 / 德银 | Deutsche Bank |
 | 汇丰 | HSBC |
 | 野村 | Nomura |
 | 大和 | Daiwa |
