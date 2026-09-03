@@ -21,6 +21,7 @@ from O365 import Account
 from requests.exceptions import HTTPError as RequestsHTTPError
 
 import sharepoint
+from classifier import classify_one_report
 from metadata import build_fields, parse_author, parse_date
 
 load_dotenv()
@@ -47,6 +48,7 @@ ROOT_KB_ID = ""
 PROJECT_DIR = Path(__file__).resolve().parent
 DB_PATH = PROJECT_DIR / "reports.db"
 DOWNLOAD_DIR = PROJECT_DIR / "downloaded_reports"
+CATEGORIZED_ROOT = PROJECT_DIR / "categorized_reports"
 
 IMA_HEADERS = {
     "ima-openapi-clientid": IMA_CLIENT_ID,
@@ -653,6 +655,13 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
         if UPLOAD_TO_SHAREPOINT:
             upload_report_to_sharepoint(item["media_id"], item["title"], filepath)
 
+    def _classify_and_locate(media_id: str, title: str, save_dir: Path) -> Path:
+        """下载后对研报分类，返回分类后的文件路径；分类失败返回原路径。"""
+        ok, new_rel_path = classify_one_report(DB_PATH, CATEGORIZED_ROOT, media_id, title, save_dir)
+        if ok and new_rel_path:
+            return _resolve_path(new_rel_path) / title
+        return save_dir / title
+
     # ── Phase 1: 已下载未发送的存量 ──
     pending_sends = get_reports_to_send()
     if pending_sends:
@@ -695,7 +704,9 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
                 mark_downloaded(media_id)
                 download_count += 1
 
-                filepath = save_dir / title
+                # 分类（LLM）：尽力而为，失败不中断；文件可能移到分类目录
+                filepath = _classify_and_locate(media_id, title, save_dir)
+
                 _maybe_upload(item, filepath)
 
                 if SEND_MODE == "attachment":

@@ -384,8 +384,9 @@ Content-Type: application/json
 
 ```
 ima/
-├── check_reports.py            # 现有：搜索/下载/发信（可选内联上传 SharePoint + 清单邮件）
-├── categorize_reports.py       # 改造：LLM 输出扩展为 {level1,level2,level3,priority}，元数据落库
+├── check_reports.py            # 现有：搜索/下载/分类/发信（可选内联上传 SharePoint + 清单邮件）
+├── categorize_reports.py       # 改造：批量分类 CLI（复用 classifier）
+├── classifier.py               # 新增：PDF 提取 + DeepSeek 分类 + 落库 + 移动（共享，无项目内依赖）
 ├── metadata.py                 # 新增：券商映射 / 文件名解析 / SharePoint 字段构建（共享）
 ├── backfill_metadata.py        # 新增：历史已分类研报从 path 反推并回填元数据
 ├── migrate_equity_research.py  # 新增：历史 Equity Research 迁移到三级分类

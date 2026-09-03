@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 import check_reports
-import categorize_reports as cr
+from classifier import extract_text, classify_report, update_metadata, move_report, update_path
 
 
 def get_equity_to_migrate() -> list[dict[str, Any]]:
@@ -62,8 +62,8 @@ def main() -> None:
             failed += 1
             continue
 
-        text = cr.extract_text(src_file)
-        result = cr.classify_report(title, text)
+        text = extract_text(src_file)
+        result = classify_report(title, text)
         if result is None:
             print("  ✗ 分类失败，跳过")
             failed += 1
@@ -82,16 +82,16 @@ def main() -> None:
             continue
 
         # 更新 DB（author/report_date 沿用现有值）
-        cr.update_metadata(media_id, item["author"], item["report_date"], level1, level2, level3, priority)
+        update_metadata(check_reports.DB_PATH, media_id, item["author"], item["report_date"], level1, level2, level3, priority)
 
         # 移动文件到三级目录
-        new_rel_path = cr.move_report(media_id, title, src_dir, level1, level2, level3)
+        new_rel_path = move_report(check_reports.CATEGORIZED_ROOT, media_id, title, src_dir, level1, level2, level3)
         if new_rel_path is None:
             print("  ✗ 移动失败")
             failed += 1
             continue
 
-        cr.update_path(media_id, new_rel_path)
+        update_path(check_reports.DB_PATH, media_id, new_rel_path)
         print(f"  ✓ 已迁移 → {new_rel_path}")
         migrated += 1
 

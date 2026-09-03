@@ -17,7 +17,8 @@ import sqlite3
 from typing import Any
 
 import check_reports
-import categorize_reports as cr
+from classifier import update_metadata
+from metadata import parse_author, parse_date
 
 CATEGORIZED_PREFIX = "categorized_reports/"
 DEFAULT_PRIORITY = "Medium"
@@ -60,8 +61,8 @@ def main() -> None:
 
     for i, item in enumerate(items, start=1):
         level1, level2, level3 = parse_levels_from_path(item["path"])
-        author = cr.parse_author(item["title"])
-        report_date = cr.parse_date(item["title"])
+        author = parse_author(item["title"])
+        report_date = parse_date(item["title"])
         priority = DEFAULT_PRIORITY
 
         label = f"{level1}" + (f" / {level2}" if level2 else "") + (f" / {level3}" if level3 else "")
@@ -72,7 +73,7 @@ def main() -> None:
             filled += 1
             continue
 
-        cr.update_metadata(item["media_id"], author, report_date, level1, level2, level3, priority)
+        update_metadata(check_reports.DB_PATH, item["media_id"], author, report_date, level1, level2, level3, priority)
         filled += 1
 
     print(f"\n—— 完成 —— 回填 {filled} 条")

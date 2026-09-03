@@ -3,7 +3,7 @@
 import sqlite3
 
 import check_reports
-import categorize_reports as cr
+import metadata as md
 import sharepoint
 import upload_to_sharepoint as up
 
@@ -19,7 +19,7 @@ def main() -> None:
         "未知券商-无日期研报.pdf",
     ]
     for t in samples:
-        print(f"  {t}\n    author={cr.parse_author(t)!r}  date={cr.parse_date(t)!r}")
+        print(f"  {t}\n    author={md.parse_author(t)!r}  date={md.parse_date(t)!r}")
 
     # 2. DB 迁移
     print("\n=== init_db 迁移 ===")
@@ -27,7 +27,7 @@ def main() -> None:
     with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(reports)").fetchall()]
     required = [
-        "author", "report_date", "level1", "level2", "priority",
+        "author", "report_date", "level1", "level2", "level3", "priority",
         "source_kb", "sharepoint_ts", "sharepoint_item_id", "sharepoint_url",
     ]
     missing = [c for c in required if c not in cols]
@@ -39,7 +39,7 @@ def main() -> None:
     item = {
         "media_id": "pdf_test", "title": "高盛-测试-260828.pdf", "path": "downloaded_reports",
         "author": "Goldman Sachs", "report_date": "2026-08-28",
-        "level1": "Macro & Strategy", "level2": "Europe", "priority": "Low",
+        "level1": "Macro & Strategy", "level2": "Europe", "level3": "", "priority": "Low",
         "source_kb": "环球研报直通车", "sharepoint_ts": 0, "sharepoint_item_id": "",
     }
     print("  ", up.build_fields(item))
