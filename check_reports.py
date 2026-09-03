@@ -31,15 +31,13 @@ IMA_API_KEY = os.getenv("IMA_API_KEY", "")
 IMA_CLIENT_ID = os.getenv("IMA_CLIENT_ID", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
+LIST_EMAIL_TO = os.getenv("LIST_EMAIL_TO", "")
 KEYWORD_IGNORE = os.getenv("KEYWORD_IGNORE", "")
 STATUS_EMAIL_TO = os.getenv("STATUS_EMAIL_TO", "")
 O365_CLIENT_ID = os.getenv("O365_CLIENT_ID", "")
 O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET", "")
 O365_TENANT_ID = os.getenv("O365_TENANT_ID", "common")
 UPLOAD_TO_SHAREPOINT = os.getenv("UPLOAD_TO_SHAREPOINT", "false").strip().lower() in ("1", "true", "yes", "on")
-SEND_MODE = os.getenv("SEND_MODE", "digest").strip().lower()
-if SEND_MODE not in ("attachment", "digest"):
-    SEND_MODE = "digest"
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
 ROOT_KB_NAME = "环球研报直通车"
 ROOT_KB_ID = ""
@@ -421,43 +419,67 @@ def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bo
     return True
 
 
-def send_digest_email(reports: list[dict[str, Any]]) -> bool:
-    """发送最新研报清单邮件（含 SharePoint 站点链接）。返回是否发送成功。"""
-    if not reports:
-        return True
+def send_list_email() -> bool:
+    """发送 High priority 研报汇总邮件（英文）到 LIST_EMAIL_TO。
 
-    if not EMAIL_FROM or not EMAIL_TO:
-        print("[digest] 缺少 EMAIL_FROM / EMAIL_TO 配置，跳过")
+    正文列出最新的 20 个 High priority 研报的标题/撰写方/日期/分类，
+    末尾附 SharePoint 站点链接。
+    """
+    if not LIST_EMAIL_TO:
+        print("[list] 缺少 LIST_EMAIL_TO 环境变量，跳过")
+        return False
+
+    if not EMAIL_FROM:
+        print("[list] 缺少 EMAIL_FROM 环境变量，跳过")
         return False
 
     account = _get_account()
     if not account:
-        print("[digest] O365 未认证，跳过")
+        print("[list] O365 未认证，跳过")
         return False
 
-    items_html = "".join(f"<li>{html.escape(r['title'])}</li>" for r in reports)
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        rows = conn.execute(
+            "SELECT title, author, report_date, level1, level2, level3 "
+            "FROM reports WHERE priority = 'High' "
+            "ORDER BY report_date DESC, created_ts DESC LIMIT 20"
+        ).fetchall()
+
+    if not rows:
+        print("[list] 没有 High priority 研报")
+        return False
+
+    items_html = ""
+    for title, author, report_date, level1, level2, level3 in rows:
+        category = " / ".join(x for x in (level1, level2, level3) if x) or "N/A"
+        items_html += (
+            f"<li>{html.escape(title)}"
+            f"<br><small>Author: {html.escape(author or 'N/A')}"
+            f" | Date: {html.escape(report_date or 'N/A')}"
+            f" | Category: {html.escape(category)}</small></li>"
+        )
 
     site_link = sharepoint.site_url()
     link_html = ""
     if site_link:
-        link_html = f'<p>📎 <a href="{site_link}">{site_link}</a></p>'
+        link_html = f'<p>Access all reports on SharePoint: <a href="{site_link}">{site_link}</a></p>'
 
     body = (
-        f"<p>最新研报 {len(reports)} 条：</p>"
+        f"<p>Here are the latest {len(rows)} high-priority research reports:</p>"
         f"<ul>{items_html}</ul>"
         f"{link_html}"
     )
 
     try:
         m = account.new_message(resource=EMAIL_FROM)
-        m.to.add(EMAIL_TO)
-        m.subject = f"环球研报: 最新 {len(reports)} 条"
+        m.to.add(LIST_EMAIL_TO)
+        m.subject = f"High Priority Research Reports ({len(rows)})"
         m.body = body
         m.send()
-        print(f"[digest] ✓ 已发送清单邮件（{len(reports)} 条）")
+        print(f"[list] ✓ 已发送至 {LIST_EMAIL_TO}（{len(rows)} 条）")
         return True
     except Exception as e:
-        print(f"[digest] 发送失败: {e}")
+        print(f"[list] ✗ 发送失败: {e}")
         return False
 
 
@@ -637,11 +659,10 @@ def collect_reports() -> int:
 
 
 def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
-    """下载、（可选）上传、发送研报。
+    """下载、（可选）上传、逐封附件发送研报。
 
     - UPLOAD_TO_SHAREPOINT=True 时，已下载研报在发送邮件前先上传 SharePoint。
-    - SEND_MODE="attachment"：逐封附件发送；
-      SEND_MODE="digest"：汇总为一份清单邮件（含 SharePoint 站点链接）。
+    - 每个研报发送一封带附件的邮件。
 
     send_only=True 时只处理已下载未发送的存量，跳过下载。
 
@@ -649,7 +670,6 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
     """
     download_count = 0
     sent_count = 0
-    digest_items: list[dict[str, Any]] = []  # digest 模式累积的研报
 
     def _maybe_upload(item: dict[str, Any], filepath: Path) -> None:
         if UPLOAD_TO_SHAREPOINT:
@@ -675,17 +695,14 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
 
             _maybe_upload(item, filepath)
 
-            if SEND_MODE == "attachment":
-                result = send_email(title, filepath)
-                if result == SEND_OK:
-                    mark_sent(item["media_id"])
-                    sent_count += 1
-                elif result == SEND_CLIENT_ERROR:
-                    continue  # 400 错误，继续处理下一条
-                else:
-                    break  # 其它发送错误，终止后续处理
+            result = send_email(title, filepath)
+            if result == SEND_OK:
+                mark_sent(item["media_id"])
+                sent_count += 1
+            elif result == SEND_CLIENT_ERROR:
+                continue  # 400 错误，继续处理下一条
             else:
-                digest_items.append(item)
+                break  # 其它发送错误，终止后续处理
 
     # ── Phase 2: 逐个下载并处理 ──
     if not send_only:
@@ -709,21 +726,11 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
 
                 _maybe_upload(item, filepath)
 
-                if SEND_MODE == "attachment":
-                    if send_email(title, filepath) == SEND_OK:
-                        mark_sent(media_id)
-                        sent_count += 1
-                else:
-                    digest_items.append(item)
+                if send_email(title, filepath) == SEND_OK:
+                    mark_sent(media_id)
+                    sent_count += 1
         else:
             print("[download] 没有需要下载的新研报")
-
-    # ── digest 模式：统一发送清单 ──
-    if SEND_MODE == "digest" and digest_items:
-        if send_digest_email(digest_items):
-            for item in digest_items:
-                mark_sent(item["media_id"])
-            sent_count += len(digest_items)
 
     print(f"[summary] 本次下载 {download_count}，发送 {sent_count}，完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return download_count, sent_count
@@ -742,11 +749,21 @@ def main() -> None:
         action="store_true",
         help="只发送已下载未发送的研报，不执行搜索和下载",
     )
+    parser.add_argument(
+        "--send-list",
+        action="store_true",
+        help="向 LIST_EMAIL_TO 发送 High priority 研报汇总邮件（英文），不执行下载/发送",
+    )
     args = parser.parse_args()
 
     if args.status:
         init_db()
         send_status_report()
+        return
+
+    if args.send_list:
+        init_db()
+        send_list_email()
         return
 
     if args.sendonly:

@@ -442,8 +442,7 @@ SHAREPOINT_ENABLED=true
 # check_reports.py：下载后、发邮件前是否自动上传 SharePoint（缺省 false）
 UPLOAD_TO_SHAREPOINT=false
 
-# check_reports.py：邮件发送方式 attachment=附件逐个 / digest=清单汇总（缺省 digest）
-SEND_MODE=digest
+# check_reports.py：邮件固定为附件方式（每篇一封）；--send-list 向 LIST_EMAIL_TO 发英文汇总
 ```
 
 ---
@@ -453,7 +452,7 @@ SEND_MODE=digest
 1. **搜索**：SharePoint 顶部搜索框输入关键词即可命中标题与正文（文档库列默认进索引）；高级搜索可用 KQL：`ReportAuthor:高盛 Priority:High`。
 2. **筛选**：文档库页面右侧筛选窗格按 `Category1` / `Priority` / `ReportAuthor` / `ReportDate` 组合筛选。
 3. **阅读**：点击文件在线预览（PDF 浏览器内置预览），或下载。
-4. **提醒**：`check_reports.py` 在 `SEND_MODE=digest` 下发送「最新研报清单」邮件，正文附 SharePoint 站点链接（`https://{tenant}.sharepoint.com{site_path}`），成员一键跳转检索；`SEND_MODE=attachment` 下则逐封发送附件。
+4. **提醒**：`check_reports.py` 固定以附件方式逐封发送研报；运行 `check_reports.py --send-list` 可向 `LIST_EMAIL_TO` 发送一封英文的 High priority 研报汇总（标题/撰写方/日期/分类 + SharePoint 站点链接）。
 
 ---
 
@@ -462,14 +461,14 @@ SEND_MODE=digest
 调度链（cron 顺序执行）：
 
 ```
-check_reports（搜索→下载→[可选上传]→发送邮件）
+check_reports（搜索→下载→分类→[可选上传]→发送邮件）
    → categorize_reports（LLM 分类 + 元数据落库）
    → upload_to_sharepoint（补传/补写元数据）
 ```
 
 - `check_reports.py` 现在可配置：
   - `UPLOAD_TO_SHAREPOINT=true` 时，下载后、发邮件前自动上传 SharePoint；
-  - `SEND_MODE=digest`（缺省）时汇总为一份清单邮件（含站点链接），`attachment` 时逐封发附件。
+  - 邮件固定为附件方式（每篇一封）；`--send-list` 参数向 `LIST_EMAIL_TO` 发送 High priority 英文汇总（含站点链接）。
 - 建议调度：**每个交易日早间一次**（覆盖前一日与隔夜研报）。
 - 三个脚本独立、幂等，任一环节失败不影响其它；cron 按顺序执行并保留各自退出码。
 
