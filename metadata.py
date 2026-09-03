@@ -91,5 +91,5 @@ def build_fields(item: dict[str, Any]) -> dict[str, Any]:
     if item["author"]:
         fields["ReportAuthor"] = item["author"]
     if item["report_date"]:
-        fields["ReportDate"] = f"{item['report_date']}T00:00:00Z"
+        fields["ReportDate"] = f"{item['report_date']}T00:00:00"
     return fields

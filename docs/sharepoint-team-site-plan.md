@@ -349,7 +349,7 @@ Content-Type: application/json
 {
   "Title": "高盛-欧洲市场周报：仅数据更新-260828",
   "ReportAuthor": "Goldman Sachs",
-  "ReportDate": "2026-08-28T00:00:00Z",
+  "ReportDate": "2026-08-28T00:00:00",
   "Category1": "Macro & Strategy",
   "Category2": "Europe",
   "Category3": "",        // 仅 Equity Research 填股票代码（如 "AAPL"）
@@ -496,7 +496,7 @@ check_reports（搜索→下载→[可选上传]→发送邮件）
 4. **简单上传大小上限 250MB**：PDF 研报通常远小于此，一般无需 upload session；但代码须保留大文件分支以防单文件超限。
 5. **权限类型**：`client_credentials` 运行必须授 **Application** 权限并 Admin Consent，否则 `401/403`。
 6. **429 限流**：Graph 对批量操作有节流，封装统一 `Retry-After` 退避；批量上传逐条串行并留少量间隔。
-7. **日期列格式**：Graph 日期列接受 `"2026-08-28T00:00:00Z"`，空值可传 `null`。
+7. **日期列格式**：Graph 日期列**不要带 `Z`（UTC 后缀）**——带 `Z` 会被按站点时区错误解析，导致日期偏移一天（Graph 已知 bug，见微软 Q&A「Different time is returned when creating SharePoint List Item」）。应传无时区格式 `"2026-08-28T00:00:00"`，空值可传 `null`。
 8. **Choice 列取值**：`fields` 中 `Priority`/`Category1` 必须精确匹配建列时的 choices，否则写入失败。
 9. **幂等以 `media_id` 为准**：文件名可能重复，去重靠 `MediaId` 列而非文件名。
 10. **`source_kb` 等静态列**：统一从常量落库，避免每条重复判断。
