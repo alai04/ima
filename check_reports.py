@@ -440,7 +440,7 @@ def send_list_email() -> bool:
 
     with sqlite3.connect(str(DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT title, author, report_date, level1, level2, level3 "
+            "SELECT title, author, report_date, level1, level2, level3, sharepoint_url "
             "FROM reports WHERE priority = 'High' "
             "ORDER BY report_date DESC, created_ts DESC LIMIT 20"
         ).fetchall()
@@ -450,10 +450,13 @@ def send_list_email() -> bool:
         return False
 
     items_html = ""
-    for title, author, report_date, level1, level2, level3 in rows:
+    for title, author, report_date, level1, level2, level3, sharepoint_url in rows:
         category = " / ".join(x for x in (level1, level2, level3) if x) or "N/A"
+        title_html = html.escape(title)
+        if sharepoint_url:
+            title_html = f'<a href="{html.escape(sharepoint_url, quote=True)}">{title_html}</a>'
         items_html += (
-            f"<li>{html.escape(title)}"
+            f"<li>{title_html}"
             f"<br><small>Author: {html.escape(author or 'N/A')}"
             f" | Date: {html.escape(report_date or 'N/A')}"
             f" | Category: {html.escape(category)}</small></li>"
@@ -465,7 +468,7 @@ def send_list_email() -> bool:
         link_html = f'<p>Access all reports on SharePoint: <a href="{site_link}">{site_link}</a></p>'
 
     body = (
-        f"<p>Here are the latest {len(rows)} high-priority research reports:</p>"
+        f"<p>Here are the latest research reports:</p>"
         f"<ul>{items_html}</ul>"
         f"{link_html}"
     )

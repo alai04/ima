@@ -215,7 +215,7 @@ def site_url() -> str:
     """返回 SharePoint 站点 URL（用于邮件链接）。未配置 tenant 时返回空串。"""
     if not SHAREPOINT_TENANT:
         return ""
-    return f"https://{SHAREPOINT_TENANT}.sharepoint.com{SHAREPOINT_SITE_PATH}"
+    return f"https://ikariacapital.sharepoint.com{SHAREPOINT_SITE_PATH}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
