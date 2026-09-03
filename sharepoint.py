@@ -299,12 +299,23 @@ def set_fields(item_id: str, fields: dict[str, Any]) -> None:
 
 
 def find_by_media_id(media_id: str) -> dict[str, Any] | None:
-    """按 MediaId 字段查询远端是否已存在。返回 listItem（含 id/webUrl/fields）或 None。"""
+    """按 MediaId 字段查询远端是否已存在。
+
+    返回 {"drive_item_id": str, "webUrl": str} 或 None。drive_item_id 用于
+    set_fields（drive 端点）重写元数据。
+    """
     site_id = resolve_site()
     list_id = resolve_list()
     data = graph_get(
         f"/sites/{site_id}/lists/{list_id}/items",
-        params={"expand": "fields", "filter": f"fields/MediaId eq '{media_id}'"},
+        params={"expand": "driveItem", "filter": f"fields/MediaId eq '{media_id}'"},
     )
     items = data.get("value", [])
-    return items[0] if items else None
+    if not items:
+        return None
+    item = items[0]
+    drive_item = item.get("driveItem") or {}
+    return {
+        "drive_item_id": str(drive_item.get("id", "")),
+        "webUrl": item.get("webUrl", ""),
+    }

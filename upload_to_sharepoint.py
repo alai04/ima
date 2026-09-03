@@ -44,13 +44,13 @@ def get_reports_to_upload(include_uploaded: bool = False) -> list[dict[str, Any]
         where += " AND sharepoint_ts = 0"
     with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT media_id, title, path, author, report_date, level1, level2, priority, "
+            "SELECT media_id, title, path, author, report_date, level1, level2, level3, priority, "
             "source_kb, sharepoint_ts, sharepoint_item_id "
             f"FROM reports WHERE {where} ORDER BY created_ts DESC"
         ).fetchall()
     cols = [
         "media_id", "title", "path", "author", "report_date", "level1",
-        "level2", "priority", "source_kb", "sharepoint_ts", "sharepoint_item_id",
+        "level2", "level3", "priority", "source_kb", "sharepoint_ts", "sharepoint_item_id",
     ]
     return [dict(zip(cols, r)) for r in rows]
 
@@ -126,15 +126,26 @@ def main() -> None:
                 uploaded += 1
                 continue
 
-            # 分支2：幂等检查，远端已存在同 MediaId → 补标记跳过
+            # 分支2：远端已存在同 MediaId → 补标记跳过 / force 时重写元数据
             existing = sharepoint.find_by_media_id(media_id)
-            if existing and not args.force:
+            if existing:
+                drive_item_id = existing.get("drive_item_id", "")
                 web_url = existing.get("webUrl", "")
-                item_id = str(existing.get("id", ""))
-                record_item_id(media_id, item_id, web_url)
-                mark_uploaded(media_id)
-                print(f"  ⏭ 远端已存在，补标记跳过")
-                skipped += 1
+                if not drive_item_id:
+                    print("  ✗ 无法定位远端 drive item，跳过")
+                    failed += 1
+                    continue
+                if args.force:
+                    sharepoint.set_fields(drive_item_id, fields)
+                    record_item_id(media_id, drive_item_id, web_url)
+                    mark_uploaded(media_id)
+                    print("  ✓ 已重写元数据")
+                    uploaded += 1
+                else:
+                    record_item_id(media_id, drive_item_id, web_url)
+                    mark_uploaded(media_id)
+                    print("  ⏭ 远端已存在，补标记跳过")
+                    skipped += 1
                 continue
 
             # 分支3：全新上传 + 写元数据

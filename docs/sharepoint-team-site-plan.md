@@ -48,7 +48,7 @@ categorized_reports/{一级}/{二级}/
 
 1. 建立 SharePoint **Team Site** + **文档库** 作为统一共享、检索、阅读入口。
 2. 定期（随现有下载流水线）将新研报自动上传，并写入结构化元数据。
-3. 元数据至少覆盖：**撰写方、撰写日期、一级/二级分类、优先级**，且可扩展。
+3. 元数据至少覆盖：**撰写方、撰写日期、一级/二级/三级分类、优先级**，且可扩展。
 4. 团队成员通过 SharePoint 原生搜索 + 列筛选视图快速定位研报。
 
 ---
@@ -104,7 +104,8 @@ categorized_reports/{一级}/{二级}/
 | `ReportAuthor` | 撰写方 | 文本 | 券商名：高盛 / 伯恩斯坦 / 摩根士丹利… |
 | `ReportDate` | 撰写日期 | 日期和时间（仅日期） | `YYYY-MM-DD`，从文件名末尾 `-yymmdd` 解析 |
 | `Category1` | 一级分类 | 选项(Choice) | Equity Research / Macro & Strategy / Industry & Thematic / Others |
-| `Category2` | 二级分类 | 文本 | 股票代码 / 地区 / 行业 |
+| `Category2` | 二级分类 | 文本 | 行业（Equity Research / Industry & Thematic）/ 地区（Macro & Strategy） |
+| `Category3` | 三级分类 | 文本 | 股票代码（仅 Equity Research 使用） |
 | `Priority` | 优先级 | 选项(Choice) | High / Medium / Low（默认 Medium） |
 | `SourceKB` | 来源知识库 | 文本 | 固定 `环球研报直通车` |
 | `MediaId` | 媒体 ID | 文本 | IMA `media_id`，用于幂等去重 |
@@ -202,7 +203,8 @@ def get_graph_token() -> str:
 | 撰写方 | `author` | `ReportAuthor` | 文件名前缀（中文） | 正则提取后经券商中英文映射表转英文（附录 C） |
 | 撰写日期 | `report_date` | `ReportDate` | 文件名后缀 | 正则 `-(\d{6})\.pdf$` → `20yy-mm-dd` |
 | 一级分类 | `level1` | `Category1` | LLM | 复用现有 DeepSeek 分类 |
-| 二级分类 | `level2` | `Category2` | LLM | 复用现有 DeepSeek 分类 |
+| 二级分类 | `level2` | `Category2` | LLM | Equity Research/Industry & Thematic=行业；Macro & Strategy=地区 |
+| 三级分类 | `level3` | `Category3` | LLM | 仅 Equity Research=股票代码 |
 | 优先级 | `priority` | `Priority` | LLM | 并入分类 prompt 一次输出 |
 | 来源知识库 | `source_kb` | `SourceKB` | 常量 | `环球研报直通车` |
 | 媒体 ID | `media_id` | `MediaId` | IMA | 已有字段直接映射 |
@@ -252,7 +254,7 @@ def parse_date(title: str) -> str | None:
 
 ### 5.3 优先级判定（并入分类 LLM prompt）
 
-扩展 `categorize_reports.py` 的 system prompt，令 LLM 一次输出 `{level1, level2, priority}`：
+扩展 `categorize_reports.py` 的 system prompt，令 LLM 一次输出 `{level1, level2, level3, priority}`：
 
 | 优先级 | 判定标准（给 LLM 的提示） |
 |--------|--------------------------|
@@ -273,7 +275,8 @@ def parse_date(title: str) -> str | None:
 | `author` | TEXT | `''` | 撰写方 |
 | `report_date` | TEXT | `''` | `YYYY-MM-DD` |
 | `level1` | TEXT | `''` | 一级分类 |
-| `level2` | TEXT | `''` | 二级分类 |
+| `level2` | TEXT | `''` | 二级分类（行业/地区） |
+| `level3` | TEXT | `''` | 三级分类（仅 Equity Research 股票代码） |
 | `priority` | TEXT | `'Medium'` | High/Medium/Low |
 | `source_kb` | TEXT | `'环球研报直通车'` | 来源 |
 | `sharepoint_ts` | INTEGER | `0` | 上传时间戳，0=未上传 |
@@ -282,7 +285,7 @@ def parse_date(title: str) -> str | None:
 
 **变更影响**：
 
-- `categorize_reports.py`：分类结果除移动目录外，**同步写 `level1`/`level2`/`priority`/`author`/`report_date` 字段**（`author`/`report_date` 用 §5.2 正则，`priority` 用 LLM）。
+- `categorize_reports.py`：分类结果除移动目录外，**同步写 `level1`/`level2`/`level3`/`priority`/`author`/`report_date` 字段**（`author`/`report_date` 用 §5.2 正则，`priority` 用 LLM）。
 - 其余脚本（`check_reports.py` 下载/发信）不改逻辑，仅 `init_db` 增加迁移。
 
 ---
@@ -349,6 +352,7 @@ Content-Type: application/json
   "ReportDate": "2026-08-28T00:00:00Z",
   "Category1": "Macro & Strategy",
   "Category2": "Europe",
+  "Category3": "",        // 仅 Equity Research 填股票代码（如 "AAPL"）
   "Priority": "Low",
   "SourceKB": "环球研报直通车",
   "MediaId": "pdf_19ee…"
@@ -381,9 +385,10 @@ Content-Type: application/json
 ```
 ima/
 ├── check_reports.py            # 现有：搜索/下载/发信（可选内联上传 SharePoint + 清单邮件）
-├── categorize_reports.py       # 改造：LLM 输出扩展为 {level1,level2,priority}，元数据落库
+├── categorize_reports.py       # 改造：LLM 输出扩展为 {level1,level2,level3,priority}，元数据落库
 ├── metadata.py                 # 新增：券商映射 / 文件名解析 / SharePoint 字段构建（共享）
 ├── backfill_metadata.py        # 新增：历史已分类研报从 path 反推并回填元数据
+├── migrate_equity_research.py  # 新增：历史 Equity Research 迁移到三级分类
 ├── sharepoint.py               # 新增：Graph 认证 + 上传 + 元数据写入 + site_url 的封装
 ├── upload_to_sharepoint.py     # 新增：上传 CLI（读 DB → 上传 → 写字段 → 回写）
 └── docs/
@@ -476,7 +481,7 @@ check_reports（搜索→下载→[可选上传]→发送邮件）
 | 0. 站点准备 | 创建 Team Site + 文档库 + 元数据列 + 视图；Azure AD 授权 `Sites.ReadWrite.All` | 人工/管理员 | 站点可访问，列已建，应用已授权 |
 | 1. 认证打通 | `uv add msal`；`sharepoint.py` 实现 `get_graph_token` + `resolve_site` + `resolve_drive` | sharepoint.py | 能打印出 site id 与 drive id |
 | 2. 上传打通 | 实现 `upload_file` + `set_fields`；`upload_to_sharepoint.py` 骨架 | sharepoint.py / upload_to_sharepoint.py | 单文件上传成功且列值正确 |
-| 3. 元数据落库 | 扩展 `init_db` 迁移；改造 `categorize_reports.py` 输出并落库 `author/report_date/level1/level2/priority` | check_reports.py / categorize_reports.py | 分类后 DB 字段完整、正确 |
+| 3. 元数据落库 | 扩展 `init_db` 迁移；改造 `categorize_reports.py` 输出并落库 `author/report_date/level1/level2/level3/priority` | check_reports.py / categorize_reports.py | 分类后 DB 字段完整、正确 |
 | 4. 全量上传 | `upload_to_sharepoint.py` 完整流程 + 幂等 + 重试 + 中文文件名编码 | upload_to_sharepoint.py | 存量研报全量上传，重跑零重复 |
 | 5. 历史回填 | 用 `--force` 或一次性脚本回填存量 `path` 已分类研报的元数据 | upload_to_sharepoint.py | 历史研报元数据齐全 |
 | 6. 调度上线 | 接入 cron，追加上传步骤 | cron | 每日自动上传，失败有告警（状态邮件） |

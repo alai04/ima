@@ -73,8 +73,8 @@ def build_fields(item: dict[str, Any]) -> dict[str, Any]:
     """从记录 dict 构建 SharePoint 元数据字段。空值省略，避免覆盖远端已有值。
 
     item 需含键：media_id / title / author / report_date / level1 / level2 /
-    priority / source_kb。level1 为空时省略 Category1（未分类研报仍可上传，
-    分类字段由后续 categorize + upload 补齐）。
+    level3 / priority / source_kb。level1 为空时省略 Category1（未分类研报
+    仍可上传，分类字段由后续 categorize + upload 补齐）。
     """
     fields: dict[str, Any] = {
         "Title": item["title"],
@@ -86,6 +86,8 @@ def build_fields(item: dict[str, Any]) -> dict[str, Any]:
         fields["Category1"] = item["level1"]
     if item["level2"]:
         fields["Category2"] = item["level2"]
+    if item["level3"]:
+        fields["Category3"] = item["level3"]
     if item["author"]:
         fields["ReportAuthor"] = item["author"]
     if item["report_date"]:

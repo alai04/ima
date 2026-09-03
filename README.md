@@ -23,12 +23,13 @@
 8. 研报的下载与发送路径均从数据库 path 字段动态读取（相对路径以项目目录为基准）。
 
 ## 研报分类（LLM）
-对已下载的研报使用 DeepSeek LLM 进行两级分类，并将文件移动到分类目录：
+对已下载的研报使用 DeepSeek LLM 进行分类，并将文件移动到分类目录：
 
 1. 仅处理 path 为缺省值（'downloaded_reports'）且已下载（downloaded_ts > 0）的研报。
 2. 一级分类四类：Equity Research、Macro & Strategy、Industry & Thematic、Others。
-3. 二级分类：Equity Research 按公司股票代码；Macro & Strategy 按地区；Industry & Thematic 按行业；Others 不再细分。
-4. 分类后按两级分类生成新路径 categorized_reports/{一级}/{二级}/，移动文件并更新 path 字段。
+3. 二级分类：Equity Research 按行业（与 Industry & Thematic 二级一致）；Macro & Strategy 按地区；Industry & Thematic 按行业；Others 不再细分。
+4. 三级分类：仅 Equity Research 按公司股票代码（如 AAPL、0700.HK）。
+5. 分类后按分类生成新路径 categorized_reports/{一级}/{二级}/[{三级}/]，移动文件并更新 path 字段。
 
 ## 环境
 1. 知识库的API接口，参照 https://skillhub.cn/skills/ima-skills

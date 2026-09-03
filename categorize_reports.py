@@ -2,8 +2,8 @@
 
 流程：
   1. 遍历 reports 表中 path 为缺省值 'downloaded_reports' 的记录
-  2. 阅读研报内容，用 LLM 输出两级分类
-  3. 按分类生成新路径 categorized_reports/{一级}/{二级}/，移动文件并更新 path 字段
+  2. 阅读研报内容，用 LLM 输出分类（Equity Research 为三级，其余两级）
+  3. 按分类生成新路径 categorized_reports/{一级}/{二级}/[{三级}/]，移动文件并更新 path 字段
 
 用法: python categorize_reports.py [--dry-run] [-n N]
 """
@@ -64,7 +64,7 @@ def extract_text(filepath: Path, max_chars: int = MAX_TEXT_CHARS) -> str:
 # LLM 分类
 # ═══════════════════════════════════════════════════════════════════════
 
-_SYSTEM_PROMPT = """你是一名卖方研究（sell-side research）研报分类专家。根据给定的研报文件名和正文摘要，输出两级分类。
+_SYSTEM_PROMPT = """你是一名卖方研究（sell-side research）研报分类专家。根据给定的研报文件名和正文摘要，输出分类。
 
 一级分类只能是以下四类之一：
 - "Equity Research"：针对具体上市公司的个股研究（含评级、目标价、盈利预测）
@@ -73,24 +73,28 @@ _SYSTEM_PROMPT = """你是一名卖方研究（sell-side research）研报分类
 - "Others"：无法归入上述三类
 
 二级分类规则：
-- Equity Research：输出该公司股票代码（如 "AAPL"、"0700.HK"、"TCOM.US"、"688825.SH"）；若无法确定代码则输出公司英文名
+- Equity Research：输出该公司所属行业英文名（与 Industry & Thematic 的二级分类保持一致的行业名，如 "Semiconductors"、"Software"、"Autos"、"Internet"、"Pharmaceuticals" 等）
 - Macro & Strategy：输出地区（如 "China"、"US"、"Global"、"Asia ex-Japan"、"Japan"、"Europe"）
 - Industry & Thematic：输出行业英文名（如 "Semiconductors"、"Energy Storage"、"Software"、"Autos"、"Biotech"）
 - Others：输出空字符串 ""
 
+三级分类规则：
+- Equity Research：输出该公司股票代码（如 "AAPL"、"0700.HK"、"TCOM.US"、"688825.SH"）；若无法确定代码则输出公司英文名
+- 其他三类：输出空字符串 ""
+
 额外判断优先级 priority，只能是以下三档之一：
-- "High"：评级/目标价变动、首次覆盖、业绩大幅超/低于预期、重大宏观事件
+- "High"：软件行业股票、所有宏观研报、首次覆盖、业绩大幅超/低于预期
 - "Medium"：常规业绩点评、行业/策略例行更新
 - "Low"：数据更新、例行周报、会议纪要
 无法判断时输出 "Medium"。
 
 只输出 JSON，格式：
-{"level1": "...", "level2": "...", "priority": "..."}
+{"level1": "...", "level2": "...", "level3": "...", "priority": "..."}
 不要输出任何其他文字。"""
 
 
-def classify_report(title: str, text: str) -> tuple[str, str, str] | None:
-    """调用 DeepSeek 分类，返回 (level1, level2, priority)；失败返回 None。"""
+def classify_report(title: str, text: str) -> tuple[str, str, str, str] | None:
+    """调用 DeepSeek 分类，返回 (level1, level2, level3, priority)；失败返回 None。"""
     if not DEEPSEEK_API_KEY:
         print("[classify] 缺少 DEEPSEEK_API_KEY，跳过")
         return None
@@ -141,6 +145,7 @@ def classify_report(title: str, text: str) -> tuple[str, str, str] | None:
 
     level1 = result.get("level1", "").strip()
     level2 = result.get("level2", "").strip()
+    level3 = result.get("level3", "").strip()
     priority = result.get("priority", "").strip() or "Medium"
 
     if level1 not in LEVEL1_CATEGORIES:
@@ -153,11 +158,17 @@ def classify_report(title: str, text: str) -> tuple[str, str, str] | None:
 
     if level1 == "Others":
         level2 = ""
+        level3 = ""
     if level1 != "Others" and not level2:
         print(f"[classify] 缺少二级分类 ({title}): {level1}")
         return None
+    if level1 == "Equity Research" and not level3:
+        print(f"[classify] 缺少三级分类（股票代码）({title})")
+        return None
+    if level1 != "Equity Research":
+        level3 = ""  # 仅 Equity Research 有三级分类
 
-    return level1, level2, priority
+    return level1, level2, level3, priority
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -192,22 +203,28 @@ def update_path(media_id: str, new_path: str) -> None:
         conn.commit()
 
 
-def update_metadata(media_id: str, author: str, report_date: str, level1: str, level2: str, priority: str) -> None:
-    """落库元数据字段（撰写方/撰写日期/一级分类/二级分类/优先级）。"""
+def update_metadata(media_id: str, author: str, report_date: str, level1: str, level2: str, level3: str, priority: str) -> None:
+    """落库元数据字段（撰写方/撰写日期/一级/二级/三级分类/优先级）。"""
     with sqlite3.connect(str(check_reports.DB_PATH)) as conn:
         conn.execute(
-            "UPDATE reports SET author = ?, report_date = ?, level1 = ?, level2 = ?, priority = ? "
+            "UPDATE reports SET author = ?, report_date = ?, level1 = ?, level2 = ?, level3 = ?, priority = ? "
             "WHERE media_id = ?",
-            (author, report_date, level1, level2, priority, media_id),
+            (author, report_date, level1, level2, level3, priority, media_id),
         )
         conn.commit()
 
 
-def move_report(media_id: str, title: str, src_dir: Path, level1: str, level2: str) -> str | None:
+def move_report(media_id: str, title: str, src_dir: Path, level1: str, level2: str, level3: str) -> str | None:
     """将文件移动到分类目录，返回新目录的相对路径；失败返回 None。"""
     level1 = sanitize_name(level1)
     level2 = sanitize_name(level2) if level2 else ""
-    dest_dir = CATEGORIZED_ROOT / level1 / level2 if level2 else CATEGORIZED_ROOT / level1
+    level3 = sanitize_name(level3) if level3 else ""
+    if level3:
+        dest_dir = CATEGORIZED_ROOT / level1 / level2 / level3
+    elif level2:
+        dest_dir = CATEGORIZED_ROOT / level1 / level2
+    else:
+        dest_dir = CATEGORIZED_ROOT / level1
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     src = src_dir / title
@@ -287,8 +304,8 @@ def main() -> None:
             failed += 1
             continue
 
-        level1, level2, priority = result
-        label = f"{level1}" + (f" / {level2}" if level2 else "") + f" ({priority})"
+        level1, level2, level3, priority = result
+        label = f"{level1}" + (f" / {level2}" if level2 else "") + (f" / {level3}" if level3 else "") + f" ({priority})"
         meta = f"[{author or '?'} | {report_date or '?'}]"
         print(f"  → {label} {meta}")
 
@@ -297,10 +314,10 @@ def main() -> None:
             continue
 
         # 落库元数据（分类 + 撰写方/日期/优先级）
-        update_metadata(media_id, author, report_date, level1, level2, priority)
+        update_metadata(media_id, author, report_date, level1, level2, level3, priority)
 
         # 移动文件
-        new_rel_path = move_report(media_id, title, src_dir, level1, level2)
+        new_rel_path = move_report(media_id, title, src_dir, level1, level2, level3)
         if new_rel_path is None:
             print("  ✗ 移动失败")
             failed += 1

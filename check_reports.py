@@ -83,6 +83,7 @@ def init_db() -> None:
             ("report_date", "TEXT DEFAULT ''"),
             ("level1", "TEXT DEFAULT ''"),
             ("level2", "TEXT DEFAULT ''"),
+            ("level3", "TEXT DEFAULT ''"),
             ("priority", "TEXT DEFAULT 'Medium'"),
             ("source_kb", "TEXT DEFAULT '环球研报直通车'"),
             ("sharepoint_ts", "INTEGER DEFAULT 0"),
@@ -352,7 +353,7 @@ def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bo
     """
     with sqlite3.connect(str(DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT author, report_date, level1, level2, priority, source_kb, "
+            "SELECT author, report_date, level1, level2, level3, priority, source_kb, "
             "sharepoint_ts, sharepoint_item_id FROM reports WHERE media_id = ?",
             (media_id,),
         ).fetchone()
@@ -361,7 +362,7 @@ def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bo
         print(f"[upload] 未找到记录: {media_id}")
         return False
 
-    author, report_date, level1, level2, priority, source_kb, sp_ts, sp_item_id = row
+    author, report_date, level1, level2, level3, priority, source_kb, sp_ts, sp_item_id = row
 
     if sp_ts > 0:
         return True  # 已上传
@@ -379,6 +380,7 @@ def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bo
         "report_date": report_date,
         "level1": level1,
         "level2": level2,
+        "level3": level3,
         "priority": priority,
         "source_kb": source_kb,
     }
