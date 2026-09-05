@@ -135,10 +135,17 @@ def get_reports_to_download() -> list[dict[str, Any]]:
 
 
 def get_reports_to_send() -> list[dict[str, Any]]:
-    """获取已下载但未发送的研报，按插入时间从近到远排序。"""
+    """获取已下载但未发送、且下载时间在 7 天内的研报，按插入时间从近到远排序。
+
+    下载时间超过 7 天的存量不再补发。
+    """
+    cutoff = int(time.time()) - 7 * 24 * 3600
     with sqlite3.connect(str(DB_PATH)) as conn:
         rows = conn.execute(
-            "SELECT media_id, title, path FROM reports WHERE downloaded_ts > 0 AND sendmail_ts = 0 ORDER BY created_ts DESC"
+            "SELECT media_id, title, path FROM reports "
+            "WHERE downloaded_ts > 0 AND sendmail_ts = 0 AND downloaded_ts > ? "
+            "ORDER BY created_ts DESC",
+            (cutoff,),
         ).fetchall()
     return [{"media_id": r[0], "title": r[1], "path": r[2]} for r in rows]
 
