@@ -13,7 +13,7 @@
 
 ```
 IMA 知识库"环球研报直通车"
-   │  search_knowledge（最近 3 天）
+   │  search_knowledge（最近 7 天）
    ▼
 SQLite reports 表（去重入库）
    │  get_media_info → 下载 PDF

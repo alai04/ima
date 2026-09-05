@@ -1,7 +1,7 @@
 """IMA 研报自动下载与邮件分发 CLI。
 
 功能：
-  1. 从"环球研报直通车"知识库搜索最近 3 天的研报
+  1. 从"环球研报直通车"知识库搜索最近 7 天的研报
   2. 保存到 SQLite DB（去重）
   3. 下载新增研报并立即邮件发送（下载失败则终止）
 """
@@ -641,11 +641,11 @@ def _should_ignore(title: str) -> bool:
 
 
 def collect_reports() -> int:
-    """搜索最近 3 天研报并入库，返回新增数量。"""
+    """搜索最近 7 天研报并入库，返回新增数量。"""
     today = datetime.now(timezone.utc)
     new_count = 0
     ignored_count = 0
-    for offset in reversed(range(3)):
+    for offset in reversed(range(7)):
         dt = today - timedelta(days=offset)
         date_str = dt.strftime("%y%m%d")
         print(f"[search] 搜索日期: {date_str}")
