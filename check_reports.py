@@ -292,6 +292,13 @@ SEND_CLIENT_ERROR = "client_error"  # 400 Client Error
 SEND_FAILED = "failed"              # 其它错误
 
 
+def _parse_recipients(value: str) -> list[str]:
+    """将逗号分隔的邮件地址字符串解析为地址列表（忽略空白项）。"""
+    if not value:
+        return []
+    return [addr.strip() for addr in value.split(",") if addr.strip()]
+
+
 def _get_account() -> Account | None:
     """懒初始化 O365 Account，认证后全局复用。"""
     global _account
@@ -330,7 +337,8 @@ def send_email(title: str, filepath: Path) -> str:
 
     try:
         m = account.new_message(resource=EMAIL_FROM)
-        m.to.add(EMAIL_TO)
+        for addr in _parse_recipients(EMAIL_TO):
+            m.to.add(addr)
         m.subject = f"环球研报: {title}"
         m.body = f"<p>附件为最新研报：<strong>{title}</strong></p>"
         m.attachments.add(str(filepath))
@@ -482,11 +490,12 @@ def send_list_email() -> bool:
 
     try:
         m = account.new_message(resource=EMAIL_FROM)
-        m.to.add(LIST_EMAIL_TO)
+        for addr in _parse_recipients(LIST_EMAIL_TO):
+            m.to.add(addr)
         m.subject = f"Latest Research Reports ({len(rows)})"
         m.body = body
         m.send()
-        print(f"[list] ✓ 已发送至 {LIST_EMAIL_TO}（{len(rows)} 条）")
+        print(f"[list] ✓ 已发送至 {', '.join(_parse_recipients(LIST_EMAIL_TO))}（{len(rows)} 条）")
         return True
     except Exception as e:
         print(f"[list] ✗ 发送失败: {e}")
@@ -620,11 +629,12 @@ def send_status_report() -> None:
 
     try:
         m = account.new_message(resource=EMAIL_FROM)
-        m.to.add(STATUS_EMAIL_TO)
+        for addr in _parse_recipients(STATUS_EMAIL_TO):
+            m.to.add(addr)
         m.subject = f"研报状态汇总 ({now_str})"
         m.body = html_body
         m.send()
-        print(f"[status] ✓ 已发送至 {STATUS_EMAIL_TO}")
+        print(f"[status] ✓ 已发送至 {', '.join(_parse_recipients(STATUS_EMAIL_TO))}")
     except Exception as e:
         print(f"[status] ✗ 发送失败: {e}")
 
