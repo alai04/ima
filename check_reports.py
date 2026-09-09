@@ -483,7 +483,7 @@ def send_list_email() -> bool:
     try:
         m = account.new_message(resource=EMAIL_FROM)
         m.to.add(LIST_EMAIL_TO)
-        m.subject = f"High Priority Research Reports ({len(rows)})"
+        m.subject = f"Latest Research Reports ({len(rows)})"
         m.body = body
         m.send()
         print(f"[list] ✓ 已发送至 {LIST_EMAIL_TO}（{len(rows)} 条）")
