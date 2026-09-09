@@ -492,7 +492,7 @@ def send_list_email() -> bool:
         m = account.new_message(resource=EMAIL_FROM)
         for addr in _parse_recipients(LIST_EMAIL_TO):
             m.to.add(addr)
-        m.subject = f"Latest Research Reports ({len(rows)})"
+        m.subject = f"Latest Research Reports ({datetime.now().strftime('%Y-%m-%d')})"
         m.body = body
         m.send()
         print(f"[list] ✓ 已发送至 {', '.join(_parse_recipients(LIST_EMAIL_TO))}（{len(rows)} 条）")
