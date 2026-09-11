@@ -26,7 +26,7 @@ load_dotenv()
 # ── 配置 ──────────────────────────────────────────────────────────────
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
 LEVEL1_CATEGORIES = ["Equity Research", "Macro & Strategy", "Industry & Thematic", "Others"]
 PRIORITY_CATEGORIES = ["High", "Medium", "Low"]
@@ -116,7 +116,14 @@ def classify_report(title: str, text: str) -> tuple[str, str, str, str] | None:
             )
             resp.raise_for_status()
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+            # deepseek-flash 带推理，token 上限被推理耗尽时 content 为空串
+            if not content.strip():
+                print(
+                    f"[classify] 模型返回空内容 ({title}), finish_reason={choice.get('finish_reason')}"
+                )
+                return None
     except (httpx.HTTPError, KeyError, IndexError) as e:
         print(f"[classify] API 调用失败 ({title}): {e}")
         return None

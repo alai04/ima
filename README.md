@@ -37,7 +37,7 @@
 3. 邮件发送使用 O365 (Microsoft Graph API)，所需配置 O365_CLIENT_ID, O365_CLIENT_SECRET, O365_TENANT_ID 保存在 .env 文件中。
 4. 收件人 EMAIL_TO 保存在 .env 文件中。
 5. 未下载清单邮件的收件人 LIST_EMAIL_TO 保存在 .env 文件中。
-6. 研报分类所需的 DEEPSEEK_API_KEY 保存在 .env 文件中。
+6. 研报分类所需的 DEEPSEEK_API_KEY 保存在 .env 文件中；分类默认使用 deepseek-flash 模型（可用 DEEPSEEK_MODEL 覆盖）。
 
 ## 脚本文件
 
@@ -45,5 +45,5 @@
 |------|------|
 | `check_reports.py` | 主脚本：搜索 → 入库 → 下载 → 发邮件 |
 | `list_undownloaded.py` | 辅助脚本：列出所有未下载研报并发送清单邮件 |
-| `download_from_zip.py` | 辅助脚本：从 zip 压缩包中提取 PDF 研报并标记为已下载 |
+| `download_from_zip.py` | 辅助脚本：从 zip 压缩包中提取 PDF 研报，标记为已下载并即时 LLM 分类 |
 | `categorize_reports.py` | 辅助脚本：使用 LLM 对已下载研报分类并移动至分类目录 |
