@@ -1,7 +1,7 @@
 """IMA 研报自动下载与邮件分发 CLI。
 
 功能：
-  1. 从"环球研报直通车"知识库搜索最近 7 天的研报
+  1. 按日期文件夹（形如 '9.11'）扫描"环球研报直通车"知识库最近 3 天的研报
   2. 保存到 SQLite DB（去重）
   3. 下载新增研报并立即邮件发送（下载失败则终止）
 """
@@ -9,11 +9,13 @@
 import argparse
 import html
 import os
+import re
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -41,6 +43,14 @@ UPLOAD_TO_SHAREPOINT = os.getenv("UPLOAD_TO_SHAREPOINT", "false").strip().lower(
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
 ROOT_KB_NAME = "环球研报直通车"
 ROOT_KB_ID = ""
+
+# ── 知识库目录结构约定 ────────────────────────────────────────────────
+# 根目录 → "<年份>年国际顶级投行研报" → "9月" → "9.11"（日期文件夹）
+KB_TZ = ZoneInfo("Asia/Shanghai")  # 知识库按北京时间创建日期文件夹
+COLLECT_DAYS = 3                    # 只扫描最近 3 天的日期文件夹
+FOLDER_MEDIA_TYPE = 99              # knowledge_list 中文件夹条目的 media_type
+_DAY_FOLDER_RE = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})$")  # 例: '9.11'
+_MONTH_FOLDER_RE = re.compile(r"^(\d{1,2})月?$")            # 例: '9月'
 
 # ── 路径 ──────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -203,22 +213,25 @@ def get_knowledge_base_id() -> str:
     return ROOT_KB_ID
 
 
-def search_knowledge(query: str) -> list[dict[str, Any]]:
-    """分页搜索知识库，返回全部命中的 info_list 条目。"""
+def list_folder_items(folder_id: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    """分页列出知识库文件夹下的全部条目；folder_id 为空串表示根目录。
+
+    `limit` 为必填且取值区间为 (0, 50]，缺省会返回 "value must be inside range"。
+    """
     all_items: list[dict[str, Any]] = []
     cursor = ""
     while True:
-        result = call_ima_api(
-            "search_knowledge",
-            {"query": query, "cursor": cursor, "knowledge_base_id": ROOT_KB_ID},
-        )
+        payload: dict[str, Any] = {"knowledge_base_id": ROOT_KB_ID, "cursor": cursor, "limit": limit}
+        if folder_id:
+            payload["folder_id"] = folder_id
+
+        result = call_ima_api("get_knowledge_list", payload)
         if result.get("code") != 0:
-            print(f"[search_knowledge] 失败: {result.get('msg')}")
+            print(f"[get_knowledge_list] 失败 (folder={folder_id or 'root'}): {result.get('msg')}")
             break
 
         data = result.get("data", {})
-        info_list = data.get("info_list", [])
-        all_items.extend(info_list)
+        all_items.extend(data.get("knowledge_list", []))
 
         if data.get("is_end", True):
             break
@@ -227,6 +240,69 @@ def search_knowledge(query: str) -> list[dict[str, Any]]:
             break
 
     return all_items
+
+
+def _child_folders(folder_id: str) -> dict[str, str]:
+    """返回 folder_id 下的 {文件夹名: folder_id} 映射。"""
+    return {
+        item.get("title", "").strip(): item.get("media_id", "")
+        for item in list_folder_items(folder_id)
+        if item.get("media_type") == FOLDER_MEDIA_TYPE and item.get("media_id")
+    }
+
+
+def _find_year_container(year: int) -> str:
+    """定位年份容器文件夹（如 '2026年国际顶级投行研报'），找不到则退回根目录。"""
+    for title, folder_id in _child_folders("").items():
+        if f"{year}年" in title:
+            return folder_id
+    print(f"[folder] 未找到 {year} 年容器文件夹，退回知识库根目录")
+    return ""
+
+
+def _month_folder_index(year: int) -> dict[int, str]:
+    """返回该年份下的 {月份: 月文件夹 ID}，例 {9: 'folder_xxx'}。"""
+    index: dict[int, str] = {}
+    for title, folder_id in _child_folders(_find_year_container(year)).items():
+        match = _MONTH_FOLDER_RE.match(title)
+        if match:
+            index[int(match.group(1))] = folder_id
+    return index
+
+
+def _find_day_folder(month_folder_id: str, month: int, day: int) -> str:
+    """在月文件夹下定位日期文件夹（形如 '9.11'），未找到返回空串。"""
+    for title, folder_id in _child_folders(month_folder_id).items():
+        match = _DAY_FOLDER_RE.match(title)
+        if match and (int(match.group(1)), int(match.group(2))) == (month, day):
+            return folder_id
+    return ""
+
+
+def resolve_day_folders(target_dates: list[date]) -> dict[date, str]:
+    """把目标日期映射为知识库中的日期文件夹 ID（缺失的日期不出现在结果中）。
+
+    月索引按年份缓存，避免每个日期重复请求月份列表。
+    """
+    month_index_cache: dict[int, dict[int, str]] = {}
+    resolved: dict[date, str] = {}
+
+    for target in target_dates:
+        if target.year not in month_index_cache:
+            month_index_cache[target.year] = _month_folder_index(target.year)
+        month_folder_id = month_index_cache[target.year].get(target.month)
+        if not month_folder_id:
+            print(f"[folder] 未找到 {target.year}-{target.month:02d} 月文件夹，跳过 {target.isoformat()}")
+            continue
+
+        day_folder_id = _find_day_folder(month_folder_id, target.month, target.day)
+        if not day_folder_id:
+            print(f"[folder] 未找到日期文件夹 {target.month}.{target.day}，跳过 {target.isoformat()}")
+            continue
+
+        resolved[target] = day_folder_id
+
+    return resolved
 
 
 def get_media_download_url(media_id: str) -> str | None:
@@ -651,21 +727,26 @@ def _should_ignore(title: str) -> bool:
 
 
 def collect_reports() -> int:
-    """搜索最近 7 天研报并入库，返回新增数量。"""
-    today = datetime.now(timezone.utc)
+    """扫描最近 COLLECT_DAYS 天的日期文件夹（形如 '9.11'）并入库，返回新增数量。"""
+    today = datetime.now(KB_TZ).date()
+    target_dates = [today - timedelta(days=offset) for offset in reversed(range(COLLECT_DAYS))]
+    day_folders = resolve_day_folders(target_dates)
+
     new_count = 0
     ignored_count = 0
-    for offset in reversed(range(7)):
-        dt = today - timedelta(days=offset)
-        date_str = dt.strftime("%y%m%d")
-        print(f"[search] 搜索日期: {date_str}")
+    for target in target_dates:
+        folder_id = day_folders.get(target)
+        if not folder_id:
+            continue
 
-        items = search_knowledge(date_str)
-        for item in items:
+        print(f"[search] 扫描文件夹: {target.month}.{target.day} ({folder_id})")
+        for item in list_folder_items(folder_id):
             media_id = item.get("media_id", "")
             title = item.get("title", "")
             if not media_id or not title:
                 continue
+            if item.get("media_type") == FOLDER_MEDIA_TYPE:
+                continue  # 日期文件夹内的子文件夹不入库
             if _should_ignore(title):
                 ignored_count += 1
                 print(f"[ignore] 跳过: {title}")
