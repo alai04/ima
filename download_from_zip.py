@@ -1,7 +1,8 @@
 """从 zip 压缩包中提取 PDF 研报，标记为已下载并立即分类。
 
 流程（逐个文件）：
-  1. 按标题在 DB 中定位记录（容忍空格/中英文标点差异与文件名截断）
+  1. 按标题在 DB 中定位记录（容忍空格/中英文标点差异与文件名截断）；
+     找不到记录时不再跳过，而是以文件名作为标题在 DB 中新建记录并继续处理
   2. 解压写入该记录 path 字段指定的目录（不走 zf.extract，避免深层路径 ENAMETOOLONG）
   3. 标记 downloaded_ts
   4. 调用 LLM 分类：落库 author/report_date/level1/level2/level3/priority，
@@ -10,6 +11,7 @@
 用法: python download_from_zip.py <zip文件路径>
 """
 
+import hashlib
 import re
 import sqlite3
 import sys
@@ -42,7 +44,7 @@ OUTCOME_EXTRACTED = "解压并标记"
 OUTCOME_CLASSIFIED = "分类成功"
 OUTCOME_CLASSIFY_FAILED = "分类失败"
 OUTCOME_FUZZY_MATCH = "其中模糊匹配命中"
-OUTCOME_NO_RECORD = "跳过(无记录)"
+OUTCOME_ADDED = "新增(无记录)"
 OUTCOME_DOWNLOADED = "跳过(已下载)"
 OUTCOME_EXTRACT_FAILED = "跳过(解压失败)"
 
@@ -51,7 +53,7 @@ OUTCOME_ORDER = (
     OUTCOME_CLASSIFIED,
     OUTCOME_CLASSIFY_FAILED,
     OUTCOME_FUZZY_MATCH,
-    OUTCOME_NO_RECORD,
+    OUTCOME_ADDED,
     OUTCOME_DOWNLOADED,
     OUTCOME_EXTRACT_FAILED,
 )
@@ -115,6 +117,15 @@ class TitleIndex:
             self._normalized.setdefault(key, record)
             self._by_head.setdefault(key[:INDEX_GRAM], []).append(key)
 
+    def add(self, record: ReportRecord) -> None:
+        """把新建记录纳入索引，使同一 zip 内后续同名条目可直接命中。"""
+        self._exact.setdefault(record.title, record)
+        key = _normalize_title(record.title)
+        if not key:
+            return
+        self._normalized.setdefault(key, record)
+        self._by_head.setdefault(key[:INDEX_GRAM], []).append(key)
+
     def find(self, zip_title: str) -> tuple[ReportRecord, str] | None:
         """定位记录，返回 (记录, 匹配类型)；无命中返回 None。"""
         record = self._exact.get(zip_title)
@@ -136,6 +147,24 @@ class TitleIndex:
             return self._normalized[min(candidates, key=len)], MATCH_AFFIX
 
         return None
+
+
+def _generate_media_id(title: str) -> str:
+    """为 zip 中新发现的研报生成确定性 media_id，重复处理同一文件时不会重复入库。"""
+    digest = hashlib.sha1(title.encode("utf-8")).hexdigest()
+    return f"zip_{digest}"
+
+
+def _insert_new_record(title: str) -> ReportRecord:
+    """在 DB 中新建研报记录并返回内存中的 ReportRecord。"""
+    media_id = _generate_media_id(title)
+    check_reports.insert_report(media_id, title)
+    return ReportRecord(
+        media_id=media_id,
+        title=title,
+        downloaded_ts=0,
+        path="downloaded_reports",
+    )
 
 
 def _load_records() -> list[ReportRecord]:
@@ -197,6 +226,7 @@ def main() -> None:
     if not DEEPSEEK_API_KEY:
         print("[warn] 缺少 DEEPSEEK_API_KEY，解压后无法分类（文件将保留在 downloaded_reports）")
 
+    check_reports.init_db()
     records = _load_records()
     index = TitleIndex(records)
     downloaded_ids = {r.media_id for r in records if r.downloaded_ts > 0}
@@ -220,16 +250,19 @@ def main() -> None:
 
             match = index.find(title)
             if match is None:
-                print("跳过（DB 中无记录）")
-                stats[OUTCOME_NO_RECORD] += 1
-                continue
-
-            record, match_kind = match
-            if match_kind != MATCH_EXACT:
-                stats[OUTCOME_FUZZY_MATCH] += 1
-                note = f"（{match_kind}匹配 → {record.title}）"
-            else:
+                # DB 中无对应记录：以文件名新建记录后继续处理
+                record = _insert_new_record(title)
+                index.add(record)  # 同一 zip 内的重复条目也能命中，避免重复新增
+                print("新增到 DB", end=" ")
+                stats[OUTCOME_ADDED] += 1
                 note = ""
+            else:
+                record, match_kind = match
+                if match_kind != MATCH_EXACT:
+                    stats[OUTCOME_FUZZY_MATCH] += 1
+                    note = f"（{match_kind}匹配 → {record.title}）"
+                else:
+                    note = ""
 
             if record.media_id in downloaded_ids:
                 print(f"跳过（已下载）{note}")
