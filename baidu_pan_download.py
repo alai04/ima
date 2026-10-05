@@ -61,6 +61,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # 转存时默认使用的网盘临时目录前缀，下载完可安全删除
 DEFAULT_PAN_ROOT = "/ima_download"
 
+# 后处理只处理「最近 RECENT_DAYS 天内入库」的研报，更早的旧记录一律不处理
+RECENT_DAYS = int(os.getenv("BAIDU_PAN_RECENT_DAYS", "7") or 7)
+
 # 注意：不要手动设置 Host 头（虽然值看着一样），百度反爬会因此把分享页 302 跳转到 passport 登录页。
 WEB_HEADERS = {
     "Connection": "keep-alive",
@@ -1280,6 +1283,25 @@ class PendingFile:
     filepath: Path
 
 
+@dataclass
+class ReportRecord:
+    """reports 表中与后处理相关的字段（按标题取最新一条）。"""
+
+    media_id: str
+    created_ts: int
+    sendmail_ts: int
+    level1: str
+    path: str
+
+
+def _is_recent(created_ts: int) -> bool:
+    """记录是否属于「最近 RECENT_DAYS 天入库」。
+
+    ``created_ts`` 为 0/缺失（例如旧的存量数据）时视为旧记录，不做处理。
+    """
+    return bool(created_ts) and int(created_ts) > time.time() - RECENT_DAYS * 86400
+
+
 def _db_path_value(directory: Path) -> str:
     """DB 的 path 字段存「目录」：项目目录下用相对路径，否则用绝对路径。"""
     resolved = directory.resolve()
@@ -1296,6 +1318,9 @@ class PostProcessor:
 
     * 在独立线程里串行消费队列，下载线程不阻塞（下载和后处理并行）；
     * 每一步单独 try/except，**任何一步失败都不影响其它研报、也不影响下载**；
+    * **只处理 created_ts 在最近 RECENT_DAYS 天内的记录**，更早的旧记录一律不处理
+      （不写库、不分类、不上传、不发信）；
+    * **已分类的记录（level1 非空）不再重复调 LLM 分类**，但仍可补传/补发；
     * 已在库且已发过邮件的同名研报直接跳过，避免重复发信；
     * 依赖（pymupdf / o365 / DeepSeek 等）在构造时按需导入，
       纯下载场景（``--no-post-process``）不依赖这些包。
@@ -1311,6 +1336,7 @@ class PostProcessor:
         self.stats: dict[str, int] = {
             "db": 0,
             "classify": 0,
+            "classify_skipped": 0,
             "sharepoint": 0,
             "mail": 0,
             "skipped": 0,
@@ -1349,8 +1375,11 @@ class PostProcessor:
 
     def summary(self) -> str:
         s = self.stats
+        classify = f"{s['classify']}"
+        if s.get("classify_skipped"):
+            classify += f"(已分类跳过 {s['classify_skipped']})"
         return (
-            f"入库 {s['db']}，分类 {s['classify']}，上传 SharePoint {s['sharepoint']}，"
+            f"入库 {s['db']}，分类 {classify}，上传 SharePoint {s['sharepoint']}，"
             f"发邮件 {s['mail']}，跳过 {s['skipped']}，失败 {s['failed']}"
         )
 
@@ -1377,17 +1406,38 @@ class PostProcessor:
             log(f"  ! 后处理跳过（文件不存在）：{filepath}")
             return
 
-        media_id, already_sent = self._ensure_record(item)
-        if already_sent:
-            self.stats["skipped"] += 1
-            log(f"  · 已入库且已发过邮件，跳过后处理：{title}")
+        # 按标题取最新一条记录（不限定时间，否则无法区分「无记录」与「有旧记录」）
+        try:
+            record = self._find_record(title)
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"查询数据库失败（{title}）：{exc}")
             return
+
+        already_classified = False
+        if record is not None:
+            # 规则一：只处理 created_ts 在最近 RECENT_DAYS 天内的记录，旧记录一律不处理
+            if not _is_recent(record.created_ts):
+                self.stats["skipped"] += 1
+                log(
+                    f"  · 入库已超过 {RECENT_DAYS} 天（created_ts={record.created_ts}），"
+                    f"不做处理：{title}"
+                )
+                return
+            if record.sendmail_ts > 0:
+                self.stats["skipped"] += 1
+                log(f"  · 已入库且已发过邮件，跳过后处理：{title}")
+                return
+            media_id = record.media_id
+            # 规则二：level1 非空说明已分类过，不再重复调 LLM
+            already_classified = bool(record.level1)
+        else:
+            media_id = self._insert_new(item)
 
         # 1) 入库：标记已下载 + 落 path
         self._record_downloaded(media_id, title, filepath)
 
         # 2) 分类（LLM）：写元数据并把文件移到分类目录
-        filepath = self._classify(media_id, title, filepath)
+        filepath = self._classify(media_id, title, filepath, already_classified)
 
         # 3) 上传 SharePoint（失败不影响后续）
         if self.args.sharepoint:
@@ -1420,30 +1470,49 @@ class PostProcessor:
             self._fail(f"入库失败（{title}）：{exc}")
 
     def _ensure_record(self, item: PendingFile) -> tuple[str, bool]:
-        """确保 DB 中有该研报的记录，返回 (media_id, 是否已发过邮件)。
+        """兼容旧调用：返回 (media_id, 是否已发过邮件)。"""
+        record = self._find_record(item.title)
+        if record is None:
+            return self._insert_new(item), False
+        return record.media_id, record.sendmail_ts > 0
 
-        按标题去重：同名研报（无论来自 IMA 知识库还是网盘）复用同一条记录，
-        这样已经发过邮件的研报不会被重复发送。
-        """
-        cr = self.cr
-        with sqlite3.connect(str(cr.DB_PATH)) as conn:
+    def _find_record(self, title: str) -> "ReportRecord | None":
+        """按标题查最新一条记录（不加时间过滤，created_ts 的判定交给调用方）。"""
+        with sqlite3.connect(str(self.cr.DB_PATH)) as conn:
             row = conn.execute(
-                "SELECT media_id, sendmail_ts FROM reports WHERE title = ? "
-                "ORDER BY created_ts DESC LIMIT 1",
-                (item.title,),
+                "SELECT media_id, created_ts, sendmail_ts, level1, path FROM reports "
+                "WHERE title = ? ORDER BY created_ts DESC LIMIT 1",
+                (title,),
             ).fetchone()
-        if row:
-            return str(row[0]), int(row[1] or 0) > 0
+        if row is None:
+            return None
+        return ReportRecord(
+            media_id=str(row[0]),
+            created_ts=int(row[1] or 0),
+            sendmail_ts=int(row[2] or 0),
+            level1=str(row[3] or ""),
+            path=str(row[4] or ""),
+        )
+
+    def _insert_new(self, item: PendingFile) -> str:
+        """新增一条记录（created_ts=当前时间），返回新 media_id。"""
         media_id = f"bdpan_{item.fs_id or int(time.time() * 1000)}"
         try:
-            cr.insert_report(media_id, item.title)
+            self.cr.insert_report(media_id, item.title)
         except Exception as exc:  # noqa: BLE001
             log(f"  [db] 新增记录失败（{item.title}）：{exc}")
-        return media_id, False
+        return media_id
 
-    def _classify(self, media_id: str, title: str, filepath: Path) -> Path:
-        """调用 LLM 分类；成功时返回移动后的新路径，失败/未开启时返回原路径。"""
+    def _classify(
+        self, media_id: str, title: str, filepath: Path, already_classified: bool = False
+    ) -> Path:
+        """调用 LLM 分类；成功时返回移动后的新路径，失败/未开启/已分类时返回原路径。"""
         if not self.args.classify:
+            return filepath
+        if already_classified:
+            # 规则二：level1 非空 = 已分类，不再重复分类（文件已在分类目录里）
+            self.stats["classify_skipped"] += 1
+            log(f"  · 已分类（level1 非空），跳过 LLM 分类：{title}")
             return filepath
         cr, cl = self.cr, self.classifier
         try:
@@ -1550,6 +1619,9 @@ def _load_known_locations() -> dict[str, str]:
 
     分类会把下载好的文件移入 ``categorized_reports/...``，因此重跑时不能只看
     ``--out`` 目录，否则已处理过的研报会被重新下载一遍。
+
+    注意：这里**不**按 RECENT_DAYS 过滤——它只用于「避免重复下载」，
+    不参与任何处理；旧记录是否处理由 :meth:`PostProcessor._process` 判定。
     """
     db_path = PROJECT_DIR / "reports.db"
     if not db_path.exists():

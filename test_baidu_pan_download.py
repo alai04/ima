@@ -156,6 +156,7 @@ def _test_post_processor() -> None:
     import sqlite3
     import sys
     import tempfile
+    import time
     from pathlib import Path
 
     tmp = Path(tempfile.mkdtemp())
@@ -184,7 +185,7 @@ def _test_post_processor() -> None:
                 try:
                     conn.execute(
                         "INSERT INTO reports (media_id, title, created_ts) VALUES (?, ?, ?)",
-                        (media_id, title, 1),
+                        (media_id, title, int(time.time())),
                     )
                     conn.commit()
                     return True
@@ -228,8 +229,11 @@ def _test_post_processor() -> None:
     class FakeCL:
         """替身：classifier（把文件移到分类目录并写元数据）"""
 
+        calls: list[str] = []
+
         @staticmethod
         def classify_one_report(db, root, media_id, title, src_dir, dry_run=False):
+            FakeCL.calls.append(title)
             dest = Path(root) / "Equity Research" / "Autos"
             dest.mkdir(parents=True, exist_ok=True)
             src = Path(src_dir) / title
@@ -305,7 +309,10 @@ def _test_post_processor() -> None:
         post2.close()
         assert post2.stats["skipped"] == 2, post2.stats
         assert FakeCR.mails[-1] == "a-261001.pdf", FakeCR.mails
-        print("  幂等 + 失败重试 ok：", post2.summary())
+        # 已分类（level1 非空）的研报不再重复调 LLM：三次后仍只有最初的 3 次调用
+        assert FakeCL.calls == names, FakeCL.calls
+        assert post2.stats["classify"] == 0 and post2.stats["classify_skipped"] == 1, post2.stats
+        print("  幂等 + 失败重试 + 已分类不重复分类 ok：", post2.summary())
 
         # 文件不存在：只计失败，不抛异常
         post3 = b.PostProcessor(args)
@@ -314,6 +321,31 @@ def _test_post_processor() -> None:
         post3.close()
         assert post3.stats["failed"] == 1 and post3.stats["db"] == 0, post3.stats
         print("  缺失文件容错 ok")
+
+        # 规则一：created_ts 超过 7 天的旧记录一律不处理
+        old_file = tmp / "downloaded_reports" / "old-261001.pdf"
+        old_file.write_bytes(b"%PDF-1.4 old")
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "INSERT INTO reports (media_id, title, created_ts, path) VALUES (?, ?, ?, ?)",
+                ("bdpan_old", old_file.name, int(time.time()) - 8 * 86400, str(old_file.parent)),
+            )
+            conn.commit()
+        before_calls = len(FakeCL.calls)
+        post4 = b.PostProcessor(args)
+        post4.start()
+        post4.submit(b.PendingFile(fs_id="old", title=old_file.name, filepath=old_file))
+        post4.close()
+        assert post4.stats["skipped"] == 1, post4.stats
+        assert post4.stats["db"] == 0 and post4.stats["mail"] == 0, post4.stats
+        assert len(FakeCL.calls) == before_calls, "旧记录不应触发分类"
+        assert old_file.exists(), "旧记录不应被移动"
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT downloaded_ts, sendmail_ts FROM reports WHERE media_id = 'bdpan_old'"
+            ).fetchone()
+        assert row == (0, 0), row
+        print("  7 天外旧记录不处理 ok")
     finally:
         for name, module in saved.items():
             if module is None:
