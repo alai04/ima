@@ -47,6 +47,8 @@
 | `list_undownloaded.py` | 辅助脚本：列出所有未下载研报并发送清单邮件 |
 | `download_from_zip.py` | 辅助脚本：从 zip 压缩包中提取 PDF 研报，标记为已下载并即时 LLM 分类 |
 | `categorize_reports.py` | 辅助脚本：使用 LLM 对已下载研报分类并移动至分类目录 |
+| `baidu_pan_download.py` | 辅助脚本：从百度网盘分享链接（带提取码）下载整个文件夹 |
+| `test_baidu_pan_download.py` | 冒烟测试：`baidu_pan_download` 的纯函数（不联网、不需要 Cookie） |
 
 ## zip 补下载的文件名匹配（download_from_zip.py）
 
@@ -61,3 +63,76 @@ zip 内文件名与 DB `title` 常有细微差别，匹配分三级，按序尝�
 匹配到后一律用 DB 的 `title` 命名落盘，并打印 DB 标题（`（归一化匹配 → …）`）便于人工核对；
 三级都不命中则回落到「跳过（无记录）」，**不做相似度模糊绑定**——同一券商同日研报的近似标题
 相似度可达 0.98，模糊绑定会把 zip 名错配到别的记录（实测尾段匹配错配率 >10%）。
+
+## 百度网盘分享下载（baidu_pan_download.py）
+
+用于把别人分享的研报文件夹（带提取码）整包拉到本地：
+
+```bash
+export BAIDU_COOKIE='BDUSS=...; STOKEN=...'    # 也可以写进 .env，或用 --cookie / --cookie-file
+uv run python baidu_pan_download.py https://pan.baidu.com/s/1lpUp14K-1CXccXny5RlYmg --pwd 0203
+```
+
+Cookie 获取：浏览器登录 https://pan.baidu.com/ ，F12 → Network → 任意请求 → 复制请求头里的 `Cookie` 整串
+（`BDUSS` 是必需项；只给 `BDUSS` 的值也可以）。
+
+```bash
+# 先在 .env 里写一行（推荐，脚本会自动读取脚本目录与当前目录的 .env）：
+# BAIDU_COOKIE=BDUSS=xxx; STOKEN=yyy; ...
+uv run python baidu_pan_download.py <链接> --pwd 0203 --check   # 先快速校验 Cookie/提取码
+```
+
+### 排查 `[错误] Cookie 校验失败（errno=-6）`
+
+脚本会先打印「Cookie 字段（共 N 个）」，对照下表排查：
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 有 `BDUSS` 但**没有 `STOKEN`**（最常见） | 这份 Cookie 不是从**已登录的 pan.baidu.com** 复制的。`BDUSS` 只能证明「百度账号已登录」，而 `/api/*`（列表、转存、取直链）还需要 `STOKEN`——它只存在于登录网盘后的会话里 | 看下面的「正确复制 Cookie」步骤。注意：此时 `--mode list` / `--check` 仍可用（它们只走 `/share/*` 接口） |
+| 字段里没有 `BDUSS` | 只复制了 `BDUSS_BFESS`，或没复制到 Cookie 行 | 脚本会自动把 `BDUSS_BFESS` 回填为 `BDUSS`；否则重新复制 |
+| 字段数很少/为 0 | `.env` 里值被截断，或换行导致只读到了一半 | 用引号把整串包成一行：`BAIDU_COOKIE="BDUSS=...; STOKEN=..."` |
+| 字段名里出现 `Host`、`Accept` 等 | 把整段请求头粘进来了 | 现在能自动只取 `Cookie:` 行（带前缀也可），但建议直接粘值 |
+| `STOKEN` 也在，仍报 -6 | BDUSS 已过期或登录态与浏览器 UA 绑定 | 重新登录后复制；再用 `--user-agent`/`BAIDU_UA` 填「复制 Cookie 那个浏览器」的 UA |
+
+**正确复制 Cookie（必读）**
+
+Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 errno=-6。步骤：
+
+1. 浏览器打开 https://pan.baidu.com/disk/main ，确认能看到文件列表；
+   若跳到登录页或提示重新登录，先完成登录（`newlogin` 会话需要重新登录才能用于脚本）。
+2. F12 → Network → 刷新页面 → 点任意一个 `pan.baidu.com` 的请求（例如 `api/list` / `api/loginStatus`）。
+3. 右键 → Copy → **Copy request headers** → 复制其中的 `Cookie` 整串。
+   应类似：`BAIDUID=...; PANWEB=1; PSTM=...; BDUSS=...; STOKEN=...; PANPSC=...`
+   —— 只复制 `BDUSS`（或从 `www.baidu.com`、未登录的分享页复制的 Cookie）是不够的。
+4. 粘到 `.env` 的 `BAIDU_COOKIE`（建议用引号包成一行），然后跑
+   `uv run python baidu_pan_download.py <链接> --pwd <提取码> --check` 验证。
+
+其它细节：脚本按优先级读 `--cookie` > `--cookie-file` > `BAIDU_COOKIE`/`BAIDU_COOKIES`/`BAIDU_BDUSS`。
+加 `--debug` 可看到各个 `app_id` 与接口的 `errno`，便于区分「登录态问题」和「接口变化」。
+
+两种模式（`--mode`）：
+
+| 模式 | 流程 | 特点 |
+|------|------|------|
+| `transfer`（默认） | 提取码校验 → 转存到网盘 `/ima_download/<时间戳>` → 递归列举 → 取直链下载 | 接口最稳，文件夹结构完整；占用网盘空间，配合 `--cleanup` 自动清理副本 |
+| `share` | 提取码校验 → 递归遍历分享 → 逐文件取直链下载 | 不占网盘空间，但接口较老、风控更严 |
+| `list` | 只解析并打印文件树 | 先确认内容再下载 |
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--pwd` | 提取码（如 `0203`）；不传则交互式输入 |
+| `--out` | 本地保存目录，默认 `downloaded_reports` |
+| `--jobs` | 并发下载数，默认 3（非会员限速，调高收益有限） |
+| `--pan-dir` | 转存模式的目标网盘目录 |
+| `--check` | 只校验 Cookie + 提取码并打印分享根目录（排查登录问题首选） |
+| `--debug` | 打印接口调试信息（app_id / errno） |
+| `--user-agent` | 自定义 UA（登录态与浏览器绑定时用；也可用 `BAIDU_UA`） |
+| `--cleanup` | 下载完成后删除网盘里的转存副本 |
+| `--verify-md5` | 下载完成后校验 md5 |
+| `--dry-run` | 只打印文件树，不做转存/下载 |
+
+实现要点：分享页的 `yunData` 是 JS 对象字面量、`locals.mset(...)` 才是标准 JSON，解析时两条路都试；
+下载直链用 `/api/download`（sign 由页面 `sign1/sign3/timestamp` 按前端算法算出），
+再经 `LogStatistic` UA 解析 302 拿到真实 CDN 地址；下载支持断点续传与多 UA 回退。
