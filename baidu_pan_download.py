@@ -1294,12 +1294,17 @@ class ReportRecord:
     path: str
 
 
+def _recent_cutoff() -> float:
+    """「最近 RECENT_DAYS 天」的时间下界（秒）。时间策略只在这里定义。"""
+    return time.time() - RECENT_DAYS * 86400
+
+
 def _is_recent(created_ts: int) -> bool:
     """记录是否属于「最近 RECENT_DAYS 天入库」。
 
     ``created_ts`` 为 0/缺失（例如旧的存量数据）时视为旧记录，不做处理。
     """
-    return bool(created_ts) and int(created_ts) > time.time() - RECENT_DAYS * 86400
+    return bool(created_ts) and int(created_ts) > _recent_cutoff()
 
 
 def _db_path_value(directory: Path) -> str:
@@ -1620,15 +1625,19 @@ def _load_known_locations() -> dict[str, str]:
     分类会把下载好的文件移入 ``categorized_reports/...``，因此重跑时不能只看
     ``--out`` 目录，否则已处理过的研报会被重新下载一遍。
 
-    注意：这里**不**按 RECENT_DAYS 过滤——它只用于「避免重复下载」，
-    不参与任何处理；旧记录是否处理由 :meth:`PostProcessor._process` 判定。
+    这里与后处理保持一致，**只认 RECENT_DAYS 天内的记录**（created_ts 为 0/更早的
+    旧记录一律忽略）。后果：旧研报不会被识别为「已存在」，重跑同一分享时可能重新
+    下载一遍，但后处理同样不会处理它们（不分类/不上传/不发信）。
     """
     db_path = PROJECT_DIR / "reports.db"
     if not db_path.exists():
         return {}
     try:
         with sqlite3.connect(str(db_path)) as conn:
-            rows = conn.execute("SELECT title, path FROM reports").fetchall()
+            rows = conn.execute(
+                "SELECT title, path FROM reports WHERE created_ts > ?",
+                (int(_recent_cutoff()),),
+            ).fetchall()
     except sqlite3.Error:
         return {}
     known: dict[str, str] = {}

@@ -135,6 +135,10 @@ def main() -> None:
     print("=== PostProcessor ===")
     _test_post_processor()
 
+    # 11. _load_known_locations 同样只认 7 天内的记录
+    print("=== _load_known_locations（7 天过滤）===")
+    _test_known_locations()
+
     print("\n全部通过 ✅")
 
 
@@ -149,6 +153,50 @@ _SCHEMA = (
     " author TEXT DEFAULT '', report_date TEXT DEFAULT '', priority TEXT DEFAULT 'Medium',"
     " sharepoint_ts INTEGER DEFAULT 0)"
 )
+
+
+def _test_known_locations() -> None:
+    """_load_known_locations 与后处理保持一致：只认 RECENT_DAYS 天内的记录。"""
+    import sqlite3
+    import tempfile
+    import time
+    from pathlib import Path
+
+    tmp = Path(tempfile.mkdtemp())
+    cat = tmp / "categorized_reports" / "Macro"
+    cat.mkdir(parents=True)
+    now = int(time.time())
+    rows = [
+        ("bdpan_old", "old.pdf", now - 8 * 86400),  # 旧记录
+        ("bdpan_new", "new.pdf", now - 1 * 86400),  # 7 天内
+    ]
+    for _, name, _ in rows:
+        (cat / name).write_bytes(b"%PDF fake")
+    with sqlite3.connect(str(tmp / "reports.db")) as conn:
+        conn.execute(
+            "CREATE TABLE reports (media_id TEXT PRIMARY KEY, title TEXT, created_ts INT, path TEXT)"
+        )
+        for media_id, name, ts in rows:
+            conn.execute(
+                "INSERT INTO reports VALUES (?, ?, ?, ?)", (media_id, name, ts, str(cat))
+            )
+        conn.commit()
+
+    saved = (b.PROJECT_DIR, b._known_paths_cache, b._known_paths_loaded)
+    b.PROJECT_DIR = tmp
+    b._known_paths_cache, b._known_paths_loaded = {}, False
+    try:
+        known = b._load_known_locations()
+        assert set(known) == {"new.pdf"}, known  # 旧记录被过滤掉
+
+        out_dir = tmp / "downloaded_reports"
+        size = (cat / "old.pdf").stat().st_size
+        assert b._existing_local(out_dir, "d/old.pdf", size) is None, "旧记录不应被识别为已存在"
+        assert b._existing_local(out_dir, "d/new.pdf", size) == cat / "new.pdf"
+        assert b._is_recent(0) is False
+        print("  ok：旧记录被过滤，7 天内的仍能避免重复下载")
+    finally:
+        b.PROJECT_DIR, b._known_paths_cache, b._known_paths_loaded = saved
 
 
 def _test_post_processor() -> None:
