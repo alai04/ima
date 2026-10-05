@@ -30,7 +30,9 @@ import hashlib
 import json
 import os
 import posixpath
+import queue
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -54,6 +56,7 @@ except Exception:  # pragma: no cover - 没有该依赖时静默跳过
 
 BASE_URL = "https://pan.baidu.com"
 APP_ID = "250528"
+PROJECT_DIR = Path(__file__).resolve().parent
 
 # 转存时默认使用的网盘临时目录前缀，下载完可安全删除
 DEFAULT_PAN_ROOT = "/ima_download"
@@ -922,9 +925,15 @@ class BaiduPan:
             },
             headers={"Referer": share_page_url(surl)},
         )
-        if data.get("errno") != 0:
+        errno = data.get("errno")
+        if errno != 0:
+            if errno in (9019, -20):  # 9019 = need verify，-20 = 需要验证码
+                raise PanError(
+                    f"分享直下接口要求风控校验（errno={errno}）：{entry.name}；"
+                    "请改用默认的 --mode transfer（转存到自己网盘再下载）"
+                )
             raise PanError(
-                f"获取分享直链失败：{entry.name}（errno={data.get('errno')}）"
+                f"获取分享直链失败：{entry.name}（errno={errno}）"
             )
         try:
             return str(data["list"][0]["dlink"])
@@ -1259,6 +1268,226 @@ class Plan:
     url: str
     size: int
     md5: str = ""
+    fs_id: str = ""
+
+
+@dataclass
+class PendingFile:
+    """本地已存在的研报文件，等待后处理（入库/分类/上传/发信）。"""
+
+    fs_id: str
+    title: str
+    filepath: Path
+
+
+def _db_path_value(directory: Path) -> str:
+    """DB 的 path 字段存「目录」：项目目录下用相对路径，否则用绝对路径。"""
+    resolved = directory.resolve()
+    try:
+        return str(resolved.relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(resolved)
+
+
+class PostProcessor:
+    """下载完成后的串行流水线：入库 → 分类 → SharePoint → 发邮件。
+
+    设计要点：
+
+    * 在独立线程里串行消费队列，下载线程不阻塞（下载和后处理并行）；
+    * 每一步单独 try/except，**任何一步失败都不影响其它研报、也不影响下载**；
+    * 已在库且已发过邮件的同名研报直接跳过，避免重复发信；
+    * 依赖（pymupdf / o365 / DeepSeek 等）在构造时按需导入，
+      纯下载场景（``--no-post-process``）不依赖这些包。
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.queue: "queue.Queue[PendingFile | None]" = queue.Queue()
+        self.thread: threading.Thread | None = None
+        self.available = False
+        self.cr: Any = None
+        self.classifier: Any = None
+        self.stats: dict[str, int] = {
+            "db": 0,
+            "classify": 0,
+            "sharepoint": 0,
+            "mail": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        try:
+            import check_reports as cr  # noqa: PLC0415 - 按需导入，避免纯下载依赖
+            import classifier as cl  # noqa: PLC0415
+
+            cr.init_db()
+            self.cr, self.classifier = cr, cl
+            self.available = True
+        except Exception as exc:  # noqa: BLE001 - 缺依赖时降级为「只下载」
+            log(f"  ! 后处理模块不可用（分类/入库/上传/发信将跳过）：{exc}")
+
+    # ── 对外接口 ──────────────────────────────────────────────
+
+    def start(self) -> None:
+        if not self.available or self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._loop, name="bdpan-post", daemon=True)
+        self.thread.start()
+
+    def submit(self, item: PendingFile) -> None:
+        """投递一份刚下载（或本地已存在）的研报，交给后处理线程。"""
+        if self.available:
+            self.queue.put(item)
+
+    def close(self) -> None:
+        """等待队列清空后返回。"""
+        if not self.available or self.thread is None:
+            return
+        self.queue.put(None)
+        self.thread.join()
+        self.thread = None
+
+    def summary(self) -> str:
+        s = self.stats
+        return (
+            f"入库 {s['db']}，分类 {s['classify']}，上传 SharePoint {s['sharepoint']}，"
+            f"发邮件 {s['mail']}，跳过 {s['skipped']}，失败 {s['failed']}"
+        )
+
+    # ── 内部实现 ──────────────────────────────────────────────
+
+    def _loop(self) -> None:
+        while True:
+            item = self.queue.get()
+            if item is None:
+                self.queue.task_done()
+                return
+            try:
+                self._process(item)
+            except Exception as exc:  # noqa: BLE001 - 单份失败不中断队列
+                self.stats["failed"] += 1
+                log(f"  ! 后处理异常（{item.title}）：{exc}")
+            finally:
+                self.queue.task_done()
+
+    def _process(self, item: PendingFile) -> None:
+        title, filepath = item.title, item.filepath
+        if not filepath.exists():
+            self.stats["failed"] += 1
+            log(f"  ! 后处理跳过（文件不存在）：{filepath}")
+            return
+
+        media_id, already_sent = self._ensure_record(item)
+        if already_sent:
+            self.stats["skipped"] += 1
+            log(f"  · 已入库且已发过邮件，跳过后处理：{title}")
+            return
+
+        # 1) 入库：标记已下载 + 落 path
+        self._record_downloaded(media_id, title, filepath)
+
+        # 2) 分类（LLM）：写元数据并把文件移到分类目录
+        filepath = self._classify(media_id, title, filepath)
+
+        # 3) 上传 SharePoint（失败不影响后续）
+        if self.args.sharepoint:
+            self._upload(media_id, title, filepath)
+
+        # 4) 发邮件（失败不影响后续研报）
+        if self.args.mail:
+            self._send_mail(media_id, title, filepath)
+
+    def _fail(self, message: str) -> None:
+        """记录一次失败（不抛出，保证后续研报继续处理）。"""
+        self.stats["failed"] += 1
+        log(f"  ! {message}")
+
+    def _record_downloaded(self, media_id: str, title: str, filepath: Path) -> None:
+        """标记已下载并记录文件所在目录（失败不阻断后续步骤）。"""
+        try:
+            cr = self.cr
+            cr.mark_downloaded(media_id)
+            path_value = _db_path_value(filepath.parent)
+            with sqlite3.connect(str(cr.DB_PATH)) as conn:
+                conn.execute(
+                    "UPDATE reports SET path = ? WHERE media_id = ?",
+                    (path_value, media_id),
+                )
+                conn.commit()
+            self.stats["db"] += 1
+            log(f"  [db] ✓ {title} → {path_value}")
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"入库失败（{title}）：{exc}")
+
+    def _ensure_record(self, item: PendingFile) -> tuple[str, bool]:
+        """确保 DB 中有该研报的记录，返回 (media_id, 是否已发过邮件)。
+
+        按标题去重：同名研报（无论来自 IMA 知识库还是网盘）复用同一条记录，
+        这样已经发过邮件的研报不会被重复发送。
+        """
+        cr = self.cr
+        with sqlite3.connect(str(cr.DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT media_id, sendmail_ts FROM reports WHERE title = ? "
+                "ORDER BY created_ts DESC LIMIT 1",
+                (item.title,),
+            ).fetchone()
+        if row:
+            return str(row[0]), int(row[1] or 0) > 0
+        media_id = f"bdpan_{item.fs_id or int(time.time() * 1000)}"
+        try:
+            cr.insert_report(media_id, item.title)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  [db] 新增记录失败（{item.title}）：{exc}")
+        return media_id, False
+
+    def _classify(self, media_id: str, title: str, filepath: Path) -> Path:
+        """调用 LLM 分类；成功时返回移动后的新路径，失败/未开启时返回原路径。"""
+        if not self.args.classify:
+            return filepath
+        cr, cl = self.cr, self.classifier
+        try:
+            ok, new_rel = cl.classify_one_report(
+                cr.DB_PATH, cr.CATEGORIZED_ROOT, media_id, title, filepath.parent
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"分类异常（{title}）：{exc}")
+            return filepath
+        if ok and new_rel:
+            self.stats["classify"] += 1
+            return cr._resolve_path(new_rel) / title
+        self._fail(f"分类失败（{title}），文件保持原位置")
+        return filepath
+
+    def _upload(self, media_id: str, title: str, filepath: Path) -> None:
+        """上传到 SharePoint（幂等：已上传过会直接返回成功）。"""
+        try:
+            if self.cr.upload_report_to_sharepoint(media_id, title, filepath):
+                self.stats["sharepoint"] += 1
+            else:
+                self._fail(f"上传 SharePoint 失败（{title}）")
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"上传 SharePoint 异常（{title}）：{exc}")
+
+    def _send_mail(self, media_id: str, title: str, filepath: Path) -> None:
+        """发送带附件的邮件，成功则标记 sendmail_ts。"""
+        try:
+            cr = self.cr
+            result = cr.send_email(title, filepath)
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"发邮件异常（{title}）：{exc}")
+            return
+        if result == cr.SEND_OK:
+            try:
+                cr.mark_sent(media_id)
+            except Exception as exc:  # noqa: BLE001
+                self._fail(f"标记已发送失败（{title}）：{exc}")
+                return
+            self.stats["mail"] += 1
+        elif result == cr.SEND_CLIENT_ERROR:
+            self._fail(f"发邮件被拒（400，{title}）")
+        else:
+            self._fail(f"发邮件失败（{title}）")
 
 
 def load_cookie(args: argparse.Namespace) -> str:
@@ -1302,14 +1531,65 @@ def _safe_rel_path(rel: str) -> str:
     return "/".join(parts) or "unnamed"
 
 
-def _local_complete(out_dir: Path, rel: str, size: int) -> bool:
-    """本地文件是否已完整下载（用于跳过一次重复的直链请求）。"""
-    dest = out_dir / rel
-    if not dest.exists():
+def _size_matches(path: Path, size: int) -> bool:
+    """本地文件存在且大小符合预期（size<=0 时只要求非空）。"""
+    if not path.exists():
         return False
+    actual = path.stat().st_size
     if size <= 0:
-        return dest.stat().st_size > 0
-    return dest.stat().st_size == size
+        return actual > 0
+    return actual == size
+
+
+_known_paths_cache: dict[str, str] = {}
+_known_paths_loaded = False
+
+
+def _load_known_locations() -> dict[str, str]:
+    """从 reports.db 读出「标题 → 本地已存在文件路径」的映射。
+
+    分类会把下载好的文件移入 ``categorized_reports/...``，因此重跑时不能只看
+    ``--out`` 目录，否则已处理过的研报会被重新下载一遍。
+    """
+    db_path = PROJECT_DIR / "reports.db"
+    if not db_path.exists():
+        return {}
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = conn.execute("SELECT title, path FROM reports").fetchall()
+    except sqlite3.Error:
+        return {}
+    known: dict[str, str] = {}
+    for title, path_value in rows:
+        if not title or not path_value:
+            continue
+        directory = Path(str(path_value))
+        if not directory.is_absolute():
+            directory = PROJECT_DIR / directory
+        candidate = directory / str(title)
+        if candidate.exists():
+            known[str(title)] = str(candidate)
+    return known
+
+
+def _known_locations(force: bool = False) -> dict[str, str]:
+    """带缓存的 :func:`_load_known_locations`（每轮运行开始时 force 刷新）。"""
+    global _known_paths_cache, _known_paths_loaded
+    if force or not _known_paths_loaded:
+        _known_paths_cache = _load_known_locations()
+        _known_paths_loaded = True
+    return _known_paths_cache
+
+
+def _existing_local(out_dir: Path, rel: str, size: int) -> Path | None:
+    """本地是否已有完整副本：优先 ``--out``，其次 DB 记录指向的位置（分类后的目录）。"""
+    dest = out_dir / rel
+    if _size_matches(dest, size):
+        return dest
+    known = _known_locations().get(Path(rel).name)
+    if known and _size_matches(Path(known), size):
+        return Path(known)
+    return None
 
 
 def build_plan_transfer(
@@ -1317,7 +1597,7 @@ def build_plan_transfer(
     meta: ShareMeta,
     args: argparse.Namespace,
     out_dir: Path,
-) -> tuple[list[Plan], str, list[str]]:
+) -> tuple[list[Plan], str, list[PendingFile]]:
     """转存模式：转存 → 递归列举 → 生成下载计划。"""
     fs_ids = [e.fs_id for e in meta.entries]
     to_path = args.pan_dir or f"{DEFAULT_PAN_ROOT}/{int(time.time())}"
@@ -1332,16 +1612,19 @@ def build_plan_transfer(
     log(f"  网盘目录下共 {len(files)} 个文件")
 
     plans: list[Plan] = []
-    skipped: list[str] = []
+    skipped: list[PendingFile] = []
     batch = 50
     for start in range(0, len(files), batch):
         chunk = files[start : start + batch]
         pending: list[tuple[PanFile, str]] = []
         for item in chunk:
             rel = _safe_rel_path(item.path[len(to_path) :].lstrip("/"))
-            if _local_complete(out_dir, rel, item.size):
-                log(f"  = 已存在，跳过：{rel}")
-                skipped.append(rel)
+            existing = _existing_local(out_dir, rel, item.size)
+            if existing is not None:
+                log(f"  = 已存在，跳过下载：{rel}")
+                skipped.append(
+                    PendingFile(fs_id=item.fs_id, title=Path(rel).name, filepath=existing)
+                )
                 continue
             pending.append((item, rel))
         if not pending:
@@ -1354,7 +1637,14 @@ def build_plan_transfer(
                 continue
             url = pan.resolve_dlink(dlink) or dlink
             plans.append(
-                Plan(name=item.name, rel_path=rel, url=url, size=item.size, md5=item.md5)
+                Plan(
+                    name=item.name,
+                    rel_path=rel,
+                    url=url,
+                    size=item.size,
+                    md5=item.md5,
+                    fs_id=item.fs_id,
+                )
             )
     return plans, to_path, skipped
 
@@ -1366,7 +1656,7 @@ def build_plan_share(
     randsk: str,
     args: argparse.Namespace,
     out_dir: Path,
-) -> tuple[list[Plan], str, list[str]]:
+) -> tuple[list[Plan], str, list[PendingFile]]:
     """分享直下模式：递归列举分享 → 逐个取直链 → 生成下载计划。"""
     log("→ 递归列举分享目录…")
     entries = pan.walk_share(meta)
@@ -1375,29 +1665,48 @@ def build_plan_share(
     log(f"  分享内共 {len(entries)} 个文件")
 
     plans: list[Plan] = []
-    skipped: list[str] = []
+    skipped: list[PendingFile] = []
+    risk_blocked = False
     for idx, entry in enumerate(entries, 1):
         # 保留分享内原始目录结构（单层根目录不额外剥离，与 transfer 模式一致）
         rel = _safe_rel_path((entry.path or entry.name).lstrip("/"))
-        if _local_complete(out_dir, rel, entry.size):
-            log(f"  = 已存在，跳过：{rel}")
-            skipped.append(rel)
+        existing = _existing_local(out_dir, rel, entry.size)
+        if existing is not None:
+            log(f"  = 已存在，跳过下载：{rel}")
+            skipped.append(
+                PendingFile(fs_id=entry.fs_id, title=Path(rel).name, filepath=existing)
+            )
             continue
         try:
             dlink = pan.share_file_dlink(entry, meta, randsk, surl)
         except PanError as exc:
             log(f"  ! {exc}")
+            if "9019" in str(exc) or "风控" in str(exc):
+                risk_blocked = True
             continue
         url = pan.resolve_dlink(dlink) or dlink
-        plans.append(Plan(name=entry.name, rel_path=rel, url=url, size=entry.size))
+        plans.append(
+            Plan(name=entry.name, rel_path=rel, url=url, size=entry.size, fs_id=entry.fs_id)
+        )
         if idx % 20 == 0:
             log(f"  已解析 {idx}/{len(entries)} 个直链")
         time.sleep(0.2)  # 轻量限速，避免风控
+    if risk_blocked and not plans:
+        log("  ! 百度对分享直下接口做了风控校验，请改用默认的 --mode transfer 模式（转存后下载）")
     return plans, "", skipped
 
 
-def run_downloads(plans: Sequence[Plan], out_dir: Path, args: argparse.Namespace) -> int:
-    """并发下载，返回失败条数。"""
+def run_downloads(
+    plans: Sequence[Plan],
+    out_dir: Path,
+    args: argparse.Namespace,
+    post: "PostProcessor | None" = None,
+) -> int:
+    """并发下载，返回失败条数。
+
+    每份研报下载（或已存在）后会立即投递给 ``post`` 做入库/分类/上传/发信，
+    单份后处理失败不影响其它研报，也不影响下载线程。
+    """
     if not plans:
         log("没有需要下载的文件")
         return 0
@@ -1427,6 +1736,10 @@ def run_downloads(plans: Sequence[Plan], out_dir: Path, args: argparse.Namespace
             )
         except Exception as exc:  # noqa: BLE001 - 单文件失败不影响整体
             return plan, f"失败：{exc}"
+        if post is not None:
+            post.submit(
+                PendingFile(fs_id=plan.fs_id, title=Path(plan.rel_path).name, filepath=dest)
+            )
         spend = max(time.time() - started, 0.001)
         speed = human_size((plan.size or dest.stat().st_size) / spend) + "/s"
         return plan, f"完成（{human_size(dest.stat().st_size)}，{spend:.1f}s，{speed}）"
@@ -1500,6 +1813,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--verify-md5", action="store_true", help="下载完成后校验 md5（转存模式）")
     parser.add_argument("--cleanup", action="store_true", help="下载完成后删除网盘里的转存副本")
     parser.add_argument("--dry-run", action="store_true", help="只解析并打印文件树，不做任何转存/下载")
+    # ── 下载后处理（每完成一份研报立即依次执行）──
+    parser.add_argument(
+        "--post-process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="下载后逐份执行：入库 → LLM 分类 → 上传 SharePoint → 发邮件（默认开启，--no-post-process 关闭）",
+    )
+    parser.add_argument(
+        "--classify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="用 LLM 对研报分类并移入 categorized_reports（默认开启）",
+    )
+    parser.add_argument(
+        "--sharepoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="上传到 SharePoint（需 SHAREPOINT_* / O365_* 配置；默认开启）",
+    )
+    parser.add_argument(
+        "--mail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="逐份发送带附件的邮件（需 EMAIL_FROM/EMAIL_TO + O365 配置；默认开启）",
+    )
     return parser.parse_args(argv)
 
 
@@ -1579,20 +1917,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         out_dir = Path(args.out).expanduser()
+        _known_locations(force=True)  # 刷新「已处理过的研报」缓存（分类后位置会变）
+
+        # ── 下载后处理：入库 → 分类 → SharePoint → 邮件（逐份、失败隔离）──
+        post: PostProcessor | None = None
+        if args.post_process:
+            post = PostProcessor(args)
+            if post.available:
+                post.start()
+                log("→ 每完成一份研报将依次执行：入库 → 分类"
+                    + (" → 上传 SharePoint" if args.sharepoint else "")
+                    + (" → 发邮件" if args.mail else ""))
+            else:
+                post = None
 
         if args.mode == "transfer":
             plans, pan_dir, skipped = build_plan_transfer(pan, meta, args, out_dir)
         else:
             plans, pan_dir, skipped = build_plan_share(pan, meta, surl, randsk, args, out_dir)
 
-        if not plans:
-            if skipped:
-                log(f"→ {len(skipped)} 个文件已存在于本地，无需下载")
-                return 0
+        if not plans and not skipped:
             log("[错误] 没有可下载的文件")
             return 1
+        if not plans:
+            if post is not None:
+                log(f"→ {len(skipped)} 个文件已存在于本地，只做后处理")
+            else:
+                log(f"→ {len(skipped)} 个文件已存在于本地，无需下载")
 
-        failed = run_downloads(plans, out_dir, args)
+        failed = 0
+        if plans:
+            failed = run_downloads(plans, out_dir, args, post)
+
+        # 本地已存在（本次未重新下载）的文件也补做后处理，保证重跑可自愈
+        if post is not None:
+            for pending in skipped:
+                post.submit(pending)
+            post.close()
+            log(f"→ 后处理完成：{post.summary()}")
 
         if args.mode == "transfer" and pan_dir and args.cleanup:
             log(f"→ 清理网盘目录 {pan_dir}")

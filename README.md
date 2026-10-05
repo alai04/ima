@@ -115,7 +115,7 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
 | 模式 | 流程 | 特点 |
 |------|------|------|
 | `transfer`（默认） | 提取码校验 → 转存到网盘 `/ima_download/<时间戳>` → 递归列举 → 取直链下载 | 接口最稳，文件夹结构完整；占用网盘空间，配合 `--cleanup` 自动清理副本 |
-| `share` | 提取码校验 → 递归遍历分享 → 逐文件取直链下载 | 不占网盘空间，但接口较老、风控更严 |
+| `share` | 提取码校验 → 递归遍历分享 → 逐文件取直链下载 | 不占网盘空间，但接口较老：百度现在常返回 `errno=9019 (need verify)` 风控，此时请用默认的 `transfer` |
 | `list` | 只解析并打印文件树 | 先确认内容再下载 |
 
 常用参数：
@@ -132,6 +132,47 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
 | `--cleanup` | 下载完成后删除网盘里的转存副本 |
 | `--verify-md5` | 下载完成后校验 md5 |
 | `--dry-run` | 只打印文件树，不做转存/下载 |
+| `--[no-]post-process` | 下载后逐份后处理（默认开启，见下节；`--no-post-process` 只下载） |
+| `--[no-]classify` | LLM 分类并移入 `categorized_reports`（默认开启） |
+| `--[no-]sharepoint` | 上传 SharePoint（默认开启，需 `SHAREPOINT_*` / `O365_*` 配置） |
+| `--[no-]mail` | 逐份发送带附件的邮件（默认开启，需 `EMAIL_FROM` / `EMAIL_TO`） |
+
+### 下载后处理（默认开启）
+
+**每完成一份研报的下载，立即依次执行**：
+
+```
+下载完成 → ①入库(reports.db) → ②LLM 分类 → ③上传 SharePoint → ④发邮件
+```
+
+* **入库**：`reports` 表新增记录（`media_id = bdpan_<网盘fs_id>`）并标记 `downloaded_ts`，
+  同时写入 `path`（文件所在目录；项目目录下用相对路径）。
+* **分类**：调用 `classifier.classify_one_report()`，写入 `author / report_date / level1~3 / priority`，
+  并把文件**移动到** `categorized_reports/{一级}/{二级}/[{三级}/]`，同步更新 `path`。
+  未配置 `DEEPSEEK_API_KEY` 或分类失败时文件保持原位置。
+* **上传**：`check_reports.upload_report_to_sharepoint()`（幂等，已上传则直接跳过）。
+* **发邮件**：`check_reports.send_email()`，成功后标记 `sendmail_ts`。
+
+失败隔离与幂等：
+
+* 上述每一步都单独捕获异常，**任何一步失败都不会影响其它研报的下载与处理**；
+* 后处理在**独立线程**里串行消费队列，与下载并行，不拖慢下载速度；
+* 按标题去重：同名研报（无论是 IMA 知识库还是网盘来的）复用同一条记录，
+  已发过邮件（`sendmail_ts > 0`）的直接跳过，**不会重复发信**；
+* 已存在本地的文件（包括分类后已移入 `categorized_reports/` 的）也会补做后处理，
+  重跑可以自愈上次失败的环节，且**不会重新下载**（会查 DB 里记录的 `path`）；
+* 结束时打印汇总：`入库 N，分类 N，上传 SharePoint N，发邮件 N，跳过 N，失败 N`。
+
+```bash
+# 只下载不入库/不分类/不发信（纯下载）
+uv run python baidu_pan_download.py <链接> --pwd 0203 --no-post-process
+
+# 下载 + 入库 + 分类，但不上传、不发信
+uv run python baidu_pan_download.py <链接> --pwd 0203 --no-sharepoint --no-mail
+```
+
+依赖说明：后处理需要项目已有的依赖（`pymupdf`、`o365`、`httpx` 等）与 `.env` 配置；
+缺失时脚本会打印提示并**自动降级为只下载**，不会中断。
 
 实现要点：分享页的 `yunData` 是 JS 对象字面量、`locals.mset(...)` 才是标准 JSON，解析时两条路都试；
 下载直链用 `/api/download`（sign 由页面 `sign1/sign3/timestamp` 按前端算法算出），

@@ -131,7 +131,195 @@ def main() -> None:
     assert "STOKEN" in hint and "errno=-6" in hint
     print("=== session_hint ok ===")
 
+    # 10. 下载后处理：入库 → 分类 → 上传 → 发邮件（含失败隔离与幂等）
+    print("=== PostProcessor ===")
+    _test_post_processor()
+
     print("\n全部通过 ✅")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 下载后处理（用假模块替掉 check_reports / classifier，不联网、不碰真实 DB）
+# ══════════════════════════════════════════════════════════════════════
+
+_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS reports (media_id TEXT PRIMARY KEY, title TEXT NOT NULL,"
+    " downloaded_ts INTEGER DEFAULT 0, sendmail_ts INTEGER DEFAULT 0, created_ts INTEGER DEFAULT 0,"
+    " path TEXT DEFAULT '', level1 TEXT DEFAULT '', level2 TEXT DEFAULT '', level3 TEXT DEFAULT '',"
+    " author TEXT DEFAULT '', report_date TEXT DEFAULT '', priority TEXT DEFAULT 'Medium',"
+    " sharepoint_ts INTEGER DEFAULT 0)"
+)
+
+
+def _test_post_processor() -> None:
+    import argparse
+    import sqlite3
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    tmp = Path(tempfile.mkdtemp())
+    db_path, cat_root = tmp / "reports.db", tmp / "categorized_reports"
+
+    class FakeCR:
+        """替身：check_reports"""
+
+        DB_PATH, CATEGORIZED_ROOT, PROJECT_DIR = db_path, cat_root, tmp
+        SEND_OK, SEND_CLIENT_ERROR, SEND_FAILED = "ok", "client_error", "failed"
+        mails: list[str] = []
+        uploads: list[str] = []
+        fail_mail: set[str] = set()
+        fail_upload: set[str] = set()
+
+        @staticmethod
+        def init_db() -> None:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(_SCHEMA)
+                conn.commit()
+
+        @staticmethod
+        def insert_report(media_id: str, title: str) -> bool:
+            FakeCR.init_db()
+            with sqlite3.connect(str(db_path)) as conn:
+                try:
+                    conn.execute(
+                        "INSERT INTO reports (media_id, title, created_ts) VALUES (?, ?, ?)",
+                        (media_id, title, 1),
+                    )
+                    conn.commit()
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
+
+        @staticmethod
+        def mark_downloaded(media_id: str) -> None:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("UPDATE reports SET downloaded_ts = 1 WHERE media_id = ?", (media_id,))
+                conn.commit()
+
+        @staticmethod
+        def mark_sent(media_id: str) -> None:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("UPDATE reports SET sendmail_ts = 1 WHERE media_id = ?", (media_id,))
+                conn.commit()
+
+        @staticmethod
+        def _resolve_path(value: str) -> Path:
+            path = Path(value)
+            return path if path.is_absolute() else tmp / path
+
+        @staticmethod
+        def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bool:
+            if title in FakeCR.fail_upload:
+                raise RuntimeError("sharepoint boom")
+            FakeCR.uploads.append(title)
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("UPDATE reports SET sharepoint_ts = 1 WHERE media_id = ?", (media_id,))
+                conn.commit()
+            return True
+
+        @staticmethod
+        def send_email(title: str, filepath: Path) -> str:
+            if title in FakeCR.fail_mail:
+                return "failed"
+            FakeCR.mails.append(title)
+            return "ok"
+
+    class FakeCL:
+        """替身：classifier（把文件移到分类目录并写元数据）"""
+
+        @staticmethod
+        def classify_one_report(db, root, media_id, title, src_dir, dry_run=False):
+            dest = Path(root) / "Equity Research" / "Autos"
+            dest.mkdir(parents=True, exist_ok=True)
+            src = Path(src_dir) / title
+            if src.resolve() != (dest / title).resolve():
+                src.rename(dest / title)
+            with sqlite3.connect(str(db)) as conn:
+                conn.execute(
+                    "UPDATE reports SET level1 = 'Equity Research', level2 = 'Autos', path = ? "
+                    "WHERE media_id = ?",
+                    (str(dest), media_id),
+                )
+                conn.commit()
+            return True, str(dest)
+
+    saved = {name: sys.modules.get(name) for name in ("check_reports", "classifier")}
+    sys.modules["check_reports"], sys.modules["classifier"] = FakeCR, FakeCL
+    try:
+        args = argparse.Namespace(classify=True, sharepoint=True, mail=True)
+        names = ["a-261001.pdf", "b-261002.pdf", "c-261003.pdf"]
+        files = []
+        for name in names:
+            path = tmp / "downloaded_reports" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"%PDF-1.4 fake")
+            files.append(path)
+
+        # a: 发信失败；b: 上传失败；c: 全部成功
+        FakeCR.fail_mail, FakeCR.fail_upload = {"a-261001.pdf"}, {"b-261002.pdf"}
+
+        post = b.PostProcessor(args)
+        assert post.available, "PostProcessor 应可用（已注入假模块）"
+        post.start()
+        for i, path in enumerate(files):
+            post.submit(b.PendingFile(fs_id=str(100 + i), title=path.name, filepath=path))
+        post.close()
+
+        # 三份都入库并标记已下载；分类成功；文件已移到分类目录
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = {
+                row[0]: row
+                for row in conn.execute(
+                    "SELECT title, downloaded_ts, sendmail_ts, level1, path FROM reports"
+                )
+            }
+        assert set(rows) == set(names), rows
+        assert all(row[1] > 0 for row in rows.values()), rows
+        assert all(row[3] == "Equity Research" for row in rows.values()), rows
+        for path in files:
+            assert not path.exists()
+            assert (cat_root / "Equity Research" / "Autos" / path.name).exists()
+
+        # 失败隔离：a 未标记已发送；b 上传失败但仍发了邮件；c 全部完成
+        assert rows["a-261001.pdf"][2] == 0, rows
+        assert rows["b-261002.pdf"][2] > 0, rows
+        assert rows["c-261003.pdf"][2] > 0, rows
+        assert FakeCR.mails == ["b-261002.pdf", "c-261003.pdf"], FakeCR.mails
+        assert FakeCR.uploads == ["a-261001.pdf", "c-261003.pdf"], FakeCR.uploads
+        assert post.stats["failed"] == 2 and post.stats["classify"] == 3, post.stats
+        print("  失败隔离 ok：", post.summary())
+
+        # 幂等 + 重试：邮件服务恢复后只重试未发送的 a，b/c 跳过
+        FakeCR.fail_mail = set()
+        post2 = b.PostProcessor(args)
+        post2.start()
+        for i, name in enumerate(names):
+            post2.submit(
+                b.PendingFile(
+                    fs_id=str(100 + i),
+                    title=name,
+                    filepath=cat_root / "Equity Research" / "Autos" / name,
+                )
+            )
+        post2.close()
+        assert post2.stats["skipped"] == 2, post2.stats
+        assert FakeCR.mails[-1] == "a-261001.pdf", FakeCR.mails
+        print("  幂等 + 失败重试 ok：", post2.summary())
+
+        # 文件不存在：只计失败，不抛异常
+        post3 = b.PostProcessor(args)
+        post3.start()
+        post3.submit(b.PendingFile(fs_id="9", title="gone.pdf", filepath=tmp / "gone.pdf"))
+        post3.close()
+        assert post3.stats["failed"] == 1 and post3.stats["db"] == 0, post3.stats
+        print("  缺失文件容错 ok")
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 if __name__ == "__main__":
