@@ -195,6 +195,35 @@ def _test_known_locations() -> None:
         assert b._existing_local(out_dir, "d/new.pdf", size) == cat / "new.pdf"
         assert b._is_recent(0) is False
         print("  ok：旧记录被过滤，7 天内的仍能避免重复下载")
+
+        # 路径过长（OSError ENAMETOOLONG）时应跳过该条记录，不抛异常、继续处理后面的记录
+        (cat / "good2.pdf").write_bytes(b"%PDF fake")
+        with sqlite3.connect(str(tmp / "reports.db")) as conn:
+            conn.execute(
+                "INSERT INTO reports VALUES (?, ?, ?, ?)",
+                ("bdpan_long", "TOO_LONG-名称.pdf", now - 60, str(cat)),
+            )
+            conn.execute(
+                "INSERT INTO reports VALUES (?, ?, ?, ?)",
+                ("bdpan_good2", "good2.pdf", now - 120, str(cat)),
+            )
+            conn.commit()
+        real_exists = Path.exists
+
+        def fake_exists(self):
+            if "TOO_LONG" in str(self):
+                raise OSError(36, "File name too long")
+            return real_exists(self)
+
+        Path.exists = fake_exists  # type: ignore[method-assign]
+        try:
+            b._known_paths_cache, b._known_paths_loaded = {}, False
+            known = b._load_known_locations()  # 不应抛异常
+            assert set(known) == {"new.pdf", "good2.pdf"}, known  # 长的被跳过，其余照常
+            assert b._size_matches(cat / "TOO_LONG-x.pdf", 1) is False
+        finally:
+            Path.exists = real_exists  # type: ignore[method-assign]
+        print("  ok：ENAMETOOLONG 只跳过该条记录，后续记录照常处理")
     finally:
         b.PROJECT_DIR, b._known_paths_cache, b._known_paths_loaded = saved
 

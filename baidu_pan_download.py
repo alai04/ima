@@ -1406,9 +1406,13 @@ class PostProcessor:
 
     def _process(self, item: PendingFile) -> None:
         title, filepath = item.title, item.filepath
-        if not filepath.exists():
-            self.stats["failed"] += 1
-            log(f"  ! 后处理跳过（文件不存在）：{filepath}")
+        try:
+            missing = not filepath.exists()
+        except OSError as exc:  # 路径过长等
+            self._fail(f"后处理跳过（路径无法访问：{exc}）：{filepath}")
+            return
+        if missing:
+            self._fail(f"后处理跳过（文件不存在）：{filepath}")
             return
 
         # 按标题取最新一条记录（不限定时间，否则无法区分「无记录」与「有旧记录」）
@@ -1606,10 +1610,16 @@ def _safe_rel_path(rel: str) -> str:
 
 
 def _size_matches(path: Path, size: int) -> bool:
-    """本地文件存在且大小符合预期（size<=0 时只要求非空）。"""
-    if not path.exists():
+    """本地文件存在且大小符合预期（size<=0 时只要求非空）。
+
+    路径非法/过长（如 ENAMETOOLONG）时视为「本地没有」，不向上抛异常。
+    """
+    try:
+        if not path.exists():
+            return False
+        actual = path.stat().st_size
+    except OSError:
         return False
-    actual = path.stat().st_size
     if size <= 0:
         return actual > 0
     return actual == size
@@ -1641,6 +1651,7 @@ def _load_known_locations() -> dict[str, str]:
     except sqlite3.Error:
         return {}
     known: dict[str, str] = {}
+    unreadable = 0
     for title, path_value in rows:
         if not title or not path_value:
             continue
@@ -1648,8 +1659,16 @@ def _load_known_locations() -> dict[str, str]:
         if not directory.is_absolute():
             directory = PROJECT_DIR / directory
         candidate = directory / str(title)
-        if candidate.exists():
+        try:
+            exists = candidate.exists()
+        except OSError:
+            # 路径过长（ENAMETOOLONG）、权限异常等：跳过这条记录，继续处理下一条
+            unreadable += 1
+            continue
+        if exists:
             known[str(title)] = str(candidate)
+    if unreadable:
+        log(f"  ! {unreadable} 条记录的本地路径无法访问（如文件名过长），已跳过。")
     return known
 
 
