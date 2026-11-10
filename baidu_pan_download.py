@@ -18,6 +18,9 @@
 * ``share``: 不转存，直接遍历分享目录并用 ``/api/sharedownload`` 取每个文件直链下载。
   不占用网盘空间，但接口较老、风控更严，适合小规模下载。
 
+特殊情形：如果分享的根目录里**全部是 ``.zip`` 压缩包**，脚本不会转存、也不做
+入库/分类/上传/发信等后处理，直接把压缩包下载到**当前目录**就结束。
+
 Cookie 获取方式：浏览器登录 https://pan.baidu.com/ ，F12 → Network → 任意请求 →
 复制请求头里的 ``Cookie`` 整串。
 """
@@ -39,7 +42,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import requests
 
@@ -80,8 +83,12 @@ WEB_HEADERS = {
 }
 # 解析 dlink 必须用这个 UA（百度自己校验的）
 RESOLVE_UA = "LogStatistic"
-# 下载真实文件时可用的 UA，逐个尝试
+# 下载真实文件时可用的 UA，逐个尝试。
+# 注意顺序：CDN（*.baidupcs.com）当前只认「解析 dlink 的那个 UA」或普通浏览器 UA，
+# 老的 netdisk UA 会直接返回 HTTP 403（body 是 76 字节的错误页），所以放到最后兜底。
 DOWNLOAD_UAS = (
+    RESOLVE_UA,
+    WEB_HEADERS["User-Agent"],
     "netdisk;P2SP;3.0.0.8;android-android;",
     "pan.baidu.com",
     "netdisk;2.2.51.6;netdisk;10.0.63;PC;android-android",
@@ -817,12 +824,12 @@ class BaiduPan:
         ]
         return entries, int(data.get("total") or len(entries))
 
-    def walk_share(self, meta: ShareMeta) -> list[ShareEntry]:
-        """递归列出分享中的所有文件（带分享内绝对路径）。
+    def iter_share_files(self, meta: ShareMeta) -> Iterator[ShareEntry]:
+        """按广度优先逐个产出分享内的文件条目（带分享内绝对路径）。
 
         根目录用首页解析结果，子目录走 ``/share/list``；每层按 total 自动翻页。
+        做成生成器是为了让调用方可以早退（例如「是否全是 zip」只需扫到第一个非 zip 文件）。
         """
-        files: list[ShareEntry] = []
         # 根目录优先走 /share/list（路径规范、能翻页），失败再用页面解析结果
         try:
             root_entries, root_total = self.list_share_dir(meta.shareid, meta.uk, None)
@@ -861,8 +868,11 @@ class BaiduPan:
                         continue
                     queue.append((sub_dir, child, child_total))
                 else:
-                    files.append(entry)
-        return files
+                    yield entry
+
+    def walk_share(self, meta: ShareMeta) -> list[ShareEntry]:
+        """递归列出分享中的所有文件（带分享内绝对路径）。"""
+        return list(self.iter_share_files(meta))
 
     def share_sign(self, surl: str, meta: ShareMeta) -> tuple[str, int]:
         """分享下载所需的 sign/timestamp。
@@ -1139,7 +1149,12 @@ class BaiduPan:
         expected_md5: str = "",
         verify_md5: bool = False,
     ) -> None:
-        """流式下载（支持断点续传），失败自动换 UA 重试。"""
+        """流式下载（支持断点续传），失败自动换 UA / 重连续传重试。
+
+        百度 CDN 偶发 ``SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC``、连接被重置、分块
+        传输中断等问题：这类错误都是可续传的，已经落盘的 ``.part`` 会用 Range 接着写，
+        所以这里做多轮重试，而不是一次失败就放弃。
+        """
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists() and expected_size and dest.stat().st_size == expected_size:
             if not verify_md5 or not expected_md5 or _md5(dest) == expected_md5:
@@ -1147,8 +1162,12 @@ class BaiduPan:
 
         tmp = dest.with_name(dest.name + ".part")
         bduss = cookie_value(self.cookie, "BDUSS")
-        last_err = ""
-        for ua in DOWNLOAD_UAS:
+        attempts = max(1, self.retries) * len(DOWNLOAD_UAS)
+        errors: list[str] = []
+        no_progress = 0
+        for attempt in range(attempts):
+            ua = DOWNLOAD_UAS[attempt % len(DOWNLOAD_UAS)]
+            before = tmp.stat().st_size if tmp.exists() else 0
             try:
                 self._stream(url, tmp, ua, bduss, expected_size)
                 os.replace(tmp, dest)
@@ -1160,9 +1179,17 @@ class BaiduPan:
                     raise PanError("md5 校验失败")
                 return
             except PanError as exc:
-                last_err = str(exc)
-                continue
-        raise PanError(last_err or "下载失败")
+                errors.append(str(exc))
+            after = tmp.stat().st_size if tmp.exists() else 0
+            if after <= before:
+                # 一点没下下来（403/直链失效等）：换完所有 UA 仍无进展就放弃，不无限重试
+                no_progress += 1
+                if no_progress >= len(DOWNLOAD_UAS):
+                    raise PanError(errors[-1]) from None
+            else:
+                no_progress = 0
+            time.sleep(min(1.0 * (attempt + 1), 5.0))
+        raise PanError(errors[-1] if errors else "下载失败")
 
     def _stream(
         self, url: str, tmp: Path, ua: str, bduss: str, expected_size: int | None
@@ -1175,7 +1202,8 @@ class BaiduPan:
         headers = {
             "User-Agent": ua,
             "Cookie": f"BDUSS={bduss}",
-            "Referer": f"{BASE_URL}/disk/home",
+            # 不带 Referer：CDN 收到 pan.baidu.com 的 Referer 时会忽略 Range（不能续传），
+            # 部分场景直接返回 403
         }
         if pos:
             headers["Range"] = f"bytes={pos}-"
@@ -1187,15 +1215,26 @@ class BaiduPan:
             return
         if resp.status_code not in (200, 206):
             resp.close()
+            if resp.status_code == 403:
+                raise PanError(
+                    "HTTP 403（CDN 拒绝了该 UA/直链，已失效或被风控；可重试或更换 --user-agent）"
+                )
             raise PanError(f"HTTP {resp.status_code}")
         if resp.status_code == 200 and pos:
             pos = 0  # 服务端不支持续传，重头写
         mode = "ab" if (pos and resp.status_code == 206) else "wb"
-        with open(tmp, mode) as fh:
-            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    fh.write(chunk)
-        resp.close()
+        try:
+            with open(tmp, mode) as fh:
+                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        fh.write(chunk)
+        except PanError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - SSL/bad record mac、连接重置、分块中断…
+            # 已写入的部分保留在 tmp 里，外层靠 Range 续传接着下
+            raise PanError(f"传输中断（{type(exc).__name__}: {exc}）") from exc
+        finally:
+            resp.close()
 
 
 def _md5(path: Path) -> str:
@@ -1681,6 +1720,33 @@ def _known_locations(force: bool = False) -> dict[str, str]:
     return _known_paths_cache
 
 
+def _is_zip_file(name: str) -> bool:
+    """文件名是否是 zip 压缩包（大小写不敏感）。"""
+    return name.lower().endswith(".zip")
+
+
+def _share_all_zip(
+    pan: BaiduPan, meta: ShareMeta
+) -> tuple[bool, list[ShareEntry]]:
+    """判断分享内是否「全部文件都是 .zip」，并返回遍历到的文件清单。
+
+    分享根目录经常只包一层目录（如 ``261026/261026.zip``），所以不能只看根条目，
+    得实际遍历一层。为了不为普通研报分享多花请求，这里用生成器**早退**：
+    碰到第一个非 .zip 文件就立即返回 ``(False, [])``，通常只多 1~2 个请求；
+    全是 zip 时返回完整文件列表，后续下载直接复用，不再重复遍历。
+
+    命中后脚本走「直接下载到当前目录」的简化流程：不转存、不做任何后处理。
+    """
+    if not meta.entries:
+        return False, []
+    files: list[ShareEntry] = []
+    for entry in pan.iter_share_files(meta):
+        if not _is_zip_file(entry.name):
+            return False, []
+        files.append(entry)
+    return bool(files), files
+
+
 def _existing_local(out_dir: Path, rel: str, size: int) -> Path | None:
     """本地是否已有完整副本：优先 ``--out``，其次 DB 记录指向的位置（分类后的目录）。"""
     dest = out_dir / rel
@@ -1794,6 +1860,100 @@ def build_plan_share(
     if risk_blocked and not plans:
         log("  ! 百度对分享直下接口做了风控校验，请改用默认的 --mode transfer 模式（转存后下载）")
     return plans, "", skipped
+
+
+def _zip_dest_rel(entry: ShareEntry, used: set[str]) -> str:
+    """zip 压缩包落盘用的相对路径：扁平放到目标目录（只要文件名）。
+
+    分享里的 zip 往往在子目录下（如 ``261026/261026.zip``），用户要的是「直接下到当前
+    目录」，所以默认抹掉分享内的目录层级；只有同名冲突时才退回带目录的路径。
+    """
+    raw = entry.path or entry.name
+    base = posixpath.basename(raw.rstrip("/")) or entry.name
+    rel = _safe_rel_path(base)
+    if rel in used:
+        rel = _safe_rel_path(raw.lstrip("/"))
+    used.add(rel)
+    return rel
+
+
+def _zip_plans_from_share(
+    pan: BaiduPan,
+    entries: Sequence[ShareEntry],
+    meta: ShareMeta,
+    surl: str,
+    randsk: str,
+    out_dir: Path,
+) -> tuple[list[Plan], int]:
+    """为 zip 分享生成下载计划（走分享直下接口，不转存到自己的网盘）。
+
+    返回 (待下载计划, 本地已存在的个数)。
+    """
+    plans: list[Plan] = []
+    existing = 0
+    used: set[str] = set()
+    for entry in entries:
+        rel = _zip_dest_rel(entry, used)
+        dest = out_dir / rel
+        if _size_matches(dest, entry.size):
+            existing += 1
+            log(f"  = 已存在，跳过下载：{dest}")
+            continue
+        try:
+            dlink = pan.share_file_dlink(entry, meta, randsk, surl)
+        except PanError as exc:
+            log(f"  ! {exc}")
+            continue
+        url = pan.resolve_dlink(dlink) or dlink
+        plans.append(
+            Plan(
+                name=entry.name,
+                rel_path=rel,
+                url=url,
+                size=entry.size,
+                fs_id=entry.fs_id,
+            )
+        )
+        time.sleep(0.2)  # 轻量限速，避免风控
+    return plans, existing
+
+
+def download_zip_share(
+    pan: BaiduPan,
+    meta: ShareMeta,
+    entries: Sequence[ShareEntry],
+    surl: str,
+    randsk: str,
+    args: argparse.Namespace,
+    out_dir: Path,
+) -> tuple[int, str]:
+    """zip 分享：把压缩包直接下到 ``out_dir``，不转存、不做任何后处理。
+
+    返回 (失败条数, 网盘临时目录)。临时目录只在「分享直下不可用、退回转存」时非空，
+    由调用方按 ``--cleanup`` 决定是否删除。
+    """
+    log(f"→ 分享内容全部是 .zip 压缩包：直接下载到 {out_dir}（不转存、不后处理）")
+    plans: list[Plan] = []
+    existing = 0
+    try:
+        plans, existing = _zip_plans_from_share(
+            pan, entries, meta, surl, randsk, out_dir
+        )
+    except PanError as exc:
+        log(f"  ! 直接从分享取直链失败：{exc}")
+
+    if not plans and not existing:
+        log("  → 分享直下不可用，改为「转存后下载」（仍然只落到本地，不做后处理）")
+        plans, pan_dir, _ = build_plan_transfer(pan, meta, args, out_dir)
+        if not plans:
+            log("  ! 没有可下载的压缩包")
+            return 0, pan_dir
+        return run_downloads(plans, out_dir, args, None), pan_dir
+
+    if not plans:
+        log(f"→ {existing} 个压缩包已存在于本地，无需下载")
+        return 0, ""
+    return run_downloads(plans, out_dir, args, None), ""
 
 
 def run_downloads(
@@ -2015,6 +2175,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 kind = "目录" if entry.isdir else human_size(entry.size)
                 print(f"    [{kind}] {entry.name}")
             return 0
+
+        # zip 分享：直接下载到当前目录即可，不做转存 / 入库 / 分类 / 上传 / 发信
+        zip_only, zip_files = _share_all_zip(pan, meta)
+        if zip_only:
+            # 显式传了 --out 就尊重它，否则落到当前工作目录
+            zip_dir = (
+                Path(args.out).expanduser()
+                if args.out != "downloaded_reports"
+                else Path.cwd()
+            )
+            zip_dir.mkdir(parents=True, exist_ok=True)
+            failed, pan_dir = download_zip_share(
+                pan, meta, zip_files, surl, randsk, args, zip_dir
+            )
+            if pan_dir and args.cleanup:
+                log(f"→ 清理网盘目录 {pan_dir}")
+                try:
+                    pan.delete_paths([pan_dir])
+                except PanError as exc:
+                    log(f"  ! 清理失败（不影响本地文件）：{exc}")
+            return 1 if failed else 0
 
         out_dir = Path(args.out).expanduser()
         _known_locations(force=True)  # 刷新「已处理过的研报」缓存（分类后位置会变）

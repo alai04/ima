@@ -415,8 +415,8 @@ def send_email(title: str, filepath: Path) -> str:
         m = account.new_message(resource=EMAIL_FROM)
         for addr in _parse_recipients(EMAIL_TO):
             m.to.add(addr)
-        m.subject = f"环球研报: {title}"
-        m.body = f"<p>附件为最新研报：<strong>{title}</strong></p>"
+        m.subject = title
+        m.body = f"<p><strong>{title}</strong></p>"
         m.attachments.add(str(filepath))
         m.send()
         print(f"[sendmail] ✓ {title}")
