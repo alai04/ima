@@ -4,6 +4,7 @@ import sqlite3
 
 import check_reports
 import metadata as md
+import onedrive
 import sharepoint
 import upload_to_sharepoint as up
 
@@ -29,6 +30,7 @@ def main() -> None:
     required = [
         "author", "report_date", "level1", "level2", "level3", "priority",
         "source_kb", "sharepoint_ts", "sharepoint_item_id", "sharepoint_url",
+        "onedrive_ts", "onedrive_item_id", "onedrive_url",
     ]
     missing = [c for c in required if c not in cols]
     print(f"  reports 表列数: {len(cols)}")
@@ -50,6 +52,20 @@ def main() -> None:
     print("  tenant       =", "已配置" if sharepoint.SHAREPOINT_TENANT else "(未配置)")
     print("  site_path    =", "已配置" if sharepoint.SHAREPOINT_SITE_PATH else "(未配置)")
     print("  drive_name   =", sharepoint.SHAREPOINT_DRIVE_NAME)
+
+    # 5. OneDrive 配置与文件夹映射（不触发 Graph 调用）
+    print("\n=== onedrive 配置 ===")
+    print("  enabled      =", onedrive.ONEDRIVE_ENABLED)
+    print("  site_path    =", onedrive.ONEDRIVE_SITE_PATH)
+    print("  drive_name   =", onedrive.ONEDRIVE_DRIVE_NAME or "(站点默认文档库)")
+    print("  root_folder  =", onedrive.ONEDRIVE_ROOT_FOLDER)
+    for t, author in [
+        ("高盛-测试-260828.pdf", ""),
+        ("巴克莱-测试-260828.pdf", ""),
+        ("高盛-测试-260828.pdf", "Barclays"),
+        ("无前缀研报.pdf", ""),
+    ]:
+        print(f"  {t} | author={author!r} → {onedrive.target_folder(author, t)}")
 
     print("\n=== 冒烟测试通过 ===")
 

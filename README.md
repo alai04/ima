@@ -12,6 +12,9 @@
 | created_ts | int, default=0 | 1784979069 |
 | path | str, default='downloaded_reports' | 'downloaded_reports' |
 
+其余扩展列（由 `check_reports.init_db()` 自动迁移补齐）：`author`、`report_date`、
+`level1~3`、`priority`、`source_kb`、`sharepoint_ts/item_id/url`、`onedrive_ts/item_id/url`。
+
 ## 执行逻辑
 1. 按日期文件夹扫描：知识库目录结构为 根目录 /「{年份}年国际顶级投行研报」/「9月」/「9.11」；取最近 3 天（按北京时间）的日期文件夹，列出其中全部条目并取文件名。
 2. 对每条搜索结果，将 media_id, title 保存到sqlite db中，注意不要重复保存。
@@ -38,6 +41,7 @@
 4. 收件人 EMAIL_TO 保存在 .env 文件中。
 5. 未下载清单邮件的收件人 LIST_EMAIL_TO 保存在 .env 文件中。
 6. 研报分类所需的 DEEPSEEK_API_KEY 保存在 .env 文件中；分类默认使用 deepseek-flash 模型（可用 DEEPSEEK_MODEL 覆盖）。
+7. 上传 OneDrive 复用 O365 应用凭证，站点/文件夹配置见 `ONEDRIVE_*`（见下节）。
 
 ## 脚本文件
 
@@ -49,6 +53,73 @@
 | `categorize_reports.py` | 辅助脚本：使用 LLM 对已下载研报分类并移动至分类目录 |
 | `baidu_pan_download.py` | 辅助脚本：从百度网盘分享链接（带提取码）下载整个文件夹 |
 | `test_baidu_pan_download.py` | 冒烟测试：`baidu_pan_download` 的纯函数（不联网、不需要 Cookie） |
+| `sharepoint.py` | Graph 封装：平铺上传研报到 SharePoint 文档库 + 写元数据列 |
+| `upload_to_sharepoint.py` | 辅助脚本：批量上传已下载研报到 SharePoint 并写元数据 |
+| `onedrive.py` | Graph 封装：按撰写方分子文件夹上传到 OneDrive（同名覆盖，不写元数据） |
+| `upload_to_onedrive.py` | 辅助脚本：追溯补传最近 7 天已下载研报到 OneDrive |
+
+## OneDrive 上传（onedrive.py / upload_to_onedrive.py）
+
+把已下载研报上传到 OneDrive（SharePoint 文档库），**按撰写方机构名分子文件夹**，不写元数据列：
+
+```
+https://ikariacapital.sharepoint.com/sites/IkariaEquity
+  /Shared Documents/环球研报/{撰写方}/{研报文件名}
+```
+
+规则：
+1. 复用现有 O365 应用的 Graph 凭证（`O365_CLIENT_ID` / `O365_CLIENT_SECRET`），无需新账号；
+2. 子文件夹名 = 撰写方机构名（DB `author` 优先，为空时从文件名前缀解析，中文券商名映射为英文，
+   如 `高盛-xxx.pdf` → `Goldman Sachs`）；文件夹不存在则自动新建；
+3. 目标位置已有同名文件时**直接覆盖**（Graph `conflictBehavior=replace`），不会产生副本；
+4. 按撰写方建目录时会逐级校验（根文件夹 `环球研报` 缺失也会自动创建）；
+5. 超过 250MB 的文件自动走 `createUploadSession` 分片上传。
+
+环境变量（`.env`）：
+
+| 变量 | 缺省 | 说明 |
+|------|------|------|
+| `ONEDRIVE_ENABLED` | `true` | 总开关 |
+| `ONEDRIVE_TENANT` | 复用 `SHAREPOINT_TENANT` | 租户前缀（`ikariacapital`） |
+| `ONEDRIVE_SITE_PATH` | `/sites/IkariaEquity` | 站点路径 |
+| `ONEDRIVE_DRIVE_NAME` | 空 | 文档库名；空 = 站点默认文档库（Shared Documents） |
+| `ONEDRIVE_ROOT_FOLDER` | `环球研报` | 目标根文件夹 |
+| `ONEDRIVE_DEFAULT_FOLDER` | `Others` | 无法判定撰写方时的子文件夹 |
+| `UPLOAD_TO_ONEDRIVE` | `false` | 主流程（下载→发信）是否自动上传 |
+
+追溯补传（只补最近 7 天，更早的不再追溯）：
+
+```bash
+uv run python upload_to_onedrive.py --probe        # 连通性自检（列出现有子文件夹）
+uv run python upload_to_onedrive.py --dry-run      # 只打印目标路径
+uv run python upload_to_onedrive.py                # 补传最近 7 天
+uv run python upload_to_onedrive.py --days 3 -n 5  # 最近 3 天内最多 5 条
+uv run python upload_to_onedrive.py --days 0       # 不限时间（慎用）
+uv run python upload_to_onedrive.py --force        # 已传过的也重传（覆盖）
+```
+
+幂等：上传成功后回写 `reports.onedrive_ts / onedrive_item_id / onedrive_url`，
+非 `--force` 模式下 `onedrive_ts > 0` 直接跳过；即使 DB 回写失败，下次重传也只会覆盖同一路径，
+不会产生重复文件。
+
+## 主脚本命令参数（check_reports.py）
+
+| 参数 | 说明 |
+|------|------|
+| （无参数） | 搜索 → 入库 → 下载 → 分类 → 上传 → 发邮件 |
+| `--status` | 汇总研报下载/发送状态并发状态邮件，不下载 |
+| `--sendonly` | 只处理已下载未发送的存量（上传 + 发信），不搜索、不下载 |
+| `--send-list` | 向 `LIST_EMAIL_TO` 发 High priority 汇总邮件（英文），不下载 |
+| `--mail` / `--no-mail` | 是否发送研报邮件，**缺省开启**。`--no-mail` 时跳过发信（不写 `sendmail_ts`，后续可补发），下载/分类/上传 SharePoint/上传 OneDrive 均照常执行 |
+| `-h, --help` | 查看帮助 |
+
+```bash
+# 只下载+入库+上传，不发研报邮件（例如临时停发）
+uv run python check_reports.py --no-mail
+
+# 只补上传/补发存量，不搜索不下载
+uv run python check_reports.py --sendonly
+```
 
 ## zip 补下载的文件名匹配（download_from_zip.py）
 
@@ -135,6 +206,7 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
 | `--[no-]post-process` | 下载后逐份后处理（默认开启，见下节；`--no-post-process` 只下载） |
 | `--[no-]classify` | LLM 分类并移入 `categorized_reports`（默认开启） |
 | `--[no-]sharepoint` | 上传 SharePoint（默认开启，需 `SHAREPOINT_*` / `O365_*` 配置） |
+| `--[no-]onedrive` | 上传 OneDrive（默认开启，需 `ONEDRIVE_*` / `O365_*` 配置） |
 | `--[no-]mail` | 逐份发送带附件的邮件（默认开启，需 `EMAIL_FROM` / `EMAIL_TO`） |
 
 ### 下载后处理（默认开启）
@@ -142,7 +214,7 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
 **每完成一份研报的下载，立即依次执行**：
 
 ```
-下载完成 → ①入库(reports.db) → ②LLM 分类 → ③上传 SharePoint → ④发邮件
+下载完成 → ①入库(reports.db) → ②LLM 分类 → ③上传 SharePoint → ④上传 OneDrive → ⑤发邮件
 ```
 
 * **入库**：`reports` 表新增记录（`media_id = bdpan_<网盘fs_id>`）并标记 `downloaded_ts`，
@@ -150,7 +222,8 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
 * **分类**：调用 `classifier.classify_one_report()`，写入 `author / report_date / level1~3 / priority`，
   并把文件**移动到** `categorized_reports/{一级}/{二级}/[{三级}/]`，同步更新 `path`。
   未配置 `DEEPSEEK_API_KEY` 或分类失败时文件保持原位置。
-* **上传**：`check_reports.upload_report_to_sharepoint()`（幂等，已上传则直接跳过）。
+* **上传**：`check_reports.upload_report_to_sharepoint()`（幂等，已上传则直接跳过）；
+  `check_reports.upload_report_to_onedrive()` 另按撰写方分文件夹上传（同名覆盖，幂等）。
 * **发邮件**：`check_reports.send_email()`，成功后标记 `sendmail_ts`。
 
 失败隔离与幂等：
@@ -169,14 +242,14 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
   **`reports.db` 中 7 天内的记录**指向的 `path`；
 * 因此超过 7 天的旧研报不会被识别为「已存在」，重跑同一分享时可能重新下载一遍，
   但仍不会被处理（不分类/不上传/不发信），文件只会留在 `--out` 里；
-* 结束时打印汇总：`入库 N，分类 N（已分类跳过 N），上传 SharePoint N，发邮件 N，跳过 N，失败 N`。
+* 结束时打印汇总：`入库 N，分类 N（已分类跳过 N），上传 SharePoint N，上传 OneDrive N，发邮件 N，跳过 N，失败 N`。
 
 ```bash
 # 只下载不入库/不分类/不发信（纯下载）
 uv run python baidu_pan_download.py <链接> --pwd 0203 --no-post-process
 
 # 下载 + 入库 + 分类，但不上传、不发信
-uv run python baidu_pan_download.py <链接> --pwd 0203 --no-sharepoint --no-mail
+uv run python baidu_pan_download.py <链接> --pwd 0203 --no-sharepoint --no-onedrive --no-mail
 ```
 
 依赖说明：后处理需要项目已有的依赖（`pymupdf`、`o365`、`httpx` 等）与 `.env` 配置；

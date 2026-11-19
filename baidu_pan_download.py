@@ -1382,6 +1382,7 @@ class PostProcessor:
             "classify": 0,
             "classify_skipped": 0,
             "sharepoint": 0,
+            "onedrive": 0,
             "mail": 0,
             "skipped": 0,
             "failed": 0,
@@ -1424,6 +1425,7 @@ class PostProcessor:
             classify += f"(已分类跳过 {s['classify_skipped']})"
         return (
             f"入库 {s['db']}，分类 {classify}，上传 SharePoint {s['sharepoint']}，"
+            f"上传 OneDrive {s.get('onedrive', 0)}，"
             f"发邮件 {s['mail']}，跳过 {s['skipped']}，失败 {s['failed']}"
         )
 
@@ -1490,6 +1492,10 @@ class PostProcessor:
         # 3) 上传 SharePoint（失败不影响后续）
         if self.args.sharepoint:
             self._upload(media_id, title, filepath)
+
+        # 3b) 上传 OneDrive（按撰写方分文件夹；失败不影响后续）
+        if getattr(self.args, "onedrive", False):
+            self._upload_onedrive(media_id, title, filepath)
 
         # 4) 发邮件（失败不影响后续研报）
         if self.args.mail:
@@ -1585,6 +1591,16 @@ class PostProcessor:
                 self._fail(f"上传 SharePoint 失败（{title}）")
         except Exception as exc:  # noqa: BLE001
             self._fail(f"上传 SharePoint 异常（{title}）：{exc}")
+
+    def _upload_onedrive(self, media_id: str, title: str, filepath: Path) -> None:
+        """上传到 OneDrive（按撰写方分子文件夹，同名覆盖；幂等）。"""
+        try:
+            if self.cr.upload_report_to_onedrive(media_id, title, filepath):
+                self.stats["onedrive"] += 1
+            else:
+                self._fail(f"上传 OneDrive 失败（{title}）")
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"上传 OneDrive 异常（{title}）：{exc}")
 
     def _send_mail(self, media_id: str, title: str, filepath: Path) -> None:
         """发送带附件的邮件，成功则标记 sendmail_ts。"""
@@ -2078,7 +2094,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--post-process",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="下载后逐份执行：入库 → LLM 分类 → 上传 SharePoint → 发邮件（默认开启，--no-post-process 关闭）",
+        help="下载后逐份执行：入库 → LLM 分类 → 上传 SharePoint → 上传 OneDrive → 发邮件（默认开启，--no-post-process 关闭）",
     )
     parser.add_argument(
         "--classify",
@@ -2091,6 +2107,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="上传到 SharePoint（需 SHAREPOINT_* / O365_* 配置；默认开启）",
+    )
+    parser.add_argument(
+        "--onedrive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="上传到 OneDrive（按撰写方分文件夹，需 ONEDRIVE_* / O365_* 配置；默认开启）",
     )
     parser.add_argument(
         "--mail",
@@ -2208,6 +2230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 post.start()
                 log("→ 每完成一份研报将依次执行：入库 → 分类"
                     + (" → 上传 SharePoint" if args.sharepoint else "")
+                    + (" → 上传 OneDrive" if args.onedrive else "")
                     + (" → 发邮件" if args.mail else ""))
             else:
                 post = None

@@ -38,6 +38,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 SIMPLE_UPLOAD_LIMIT = 250 * 1024 * 1024  # 简单 PUT 上限 250MB
 SESSION_CHUNK_SIZE = 10 * 1024 * 1024   # upload session 分片 10MB
+MAX_429_RETRIES = 6                     # 429 退避重试上限
 
 # ── 进程内缓存 ─────────────────────────────────────────────────────────
 _app: ConfidentialClientApplication | None = None
@@ -109,16 +110,52 @@ def _raise_for_graph(resp: httpx.Response) -> None:
     )
 
 
+# 公开别名：供其它 Graph 封装（onedrive.py）复用统一错误分类
+raise_for_graph = _raise_for_graph
+
+
+def graph_request(
+    method: str,
+    url: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    content: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+    raise_on_error: bool = True,
+) -> httpx.Response:
+    """通用 Graph 请求：自动附加 Authorization，429 自动退避。
+
+    供其它 Graph 封装（如 ``onedrive.py``）复用同一套鉴权与重试语义；
+    非 429 的错误响应默认抛 ``SharePointError``，``raise_on_error=False``
+    时原样返回（调用方自行判断 404 等）。
+    """
+    hdrs = _auth_headers()
+    if headers:
+        hdrs.update(headers)
+
+    resp: httpx.Response | None = None
+    with httpx.Client(timeout=timeout) as client:
+        for _ in range(MAX_429_RETRIES):
+            resp = client.request(
+                method, url, headers=hdrs, json=json_body, content=content, params=params
+            )
+            if resp.status_code != 429:
+                break
+            time.sleep(_retry_after(resp))
+
+    assert resp is not None  # pragma: no cover - 循环至少执行一次
+    if raise_on_error:
+        _raise_for_graph(resp)
+    return resp
+
+
 def _request_json(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
     """执行返回 JSON 的请求，429 自动退避。"""
-    with httpx.Client(timeout=30.0) as client:
-        while True:
-            resp = client.request(method, url, headers=_auth_headers(), **kwargs)
-            if resp.status_code == 429:
-                time.sleep(_retry_after(resp))
-                continue
-            _raise_for_graph(resp)
-            return resp.json()
+    body = kwargs.pop("json", None)
+    resp = graph_request(method, url, json_body=body, **kwargs)
+    return resp.json()
 
 
 def graph_get(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -23,6 +23,7 @@ from O365 import Account
 from requests.exceptions import HTTPError as RequestsHTTPError
 
 import sharepoint
+import onedrive
 from classifier import classify_one_report
 from metadata import build_fields, parse_author, parse_date
 
@@ -40,6 +41,8 @@ O365_CLIENT_ID = os.getenv("O365_CLIENT_ID", "")
 O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET", "")
 O365_TENANT_ID = os.getenv("O365_TENANT_ID", "common")
 UPLOAD_TO_SHAREPOINT = os.getenv("UPLOAD_TO_SHAREPOINT", "false").strip().lower() in ("1", "true", "yes", "on")
+# 下载后、发邮件前是否自动上传 OneDrive（按撰写方分子文件夹）
+UPLOAD_TO_ONEDRIVE = os.getenv("UPLOAD_TO_ONEDRIVE", "false").strip().lower() in ("1", "true", "yes", "on")
 BASE_URL = "https://ima.qq.com/openapi/wiki/v1"
 ROOT_KB_NAME = "环球研报直通车"
 ROOT_KB_ID = ""
@@ -99,6 +102,9 @@ def init_db() -> None:
             ("sharepoint_ts", "INTEGER DEFAULT 0"),
             ("sharepoint_item_id", "TEXT DEFAULT ''"),
             ("sharepoint_url", "TEXT DEFAULT ''"),
+            ("onedrive_ts", "INTEGER DEFAULT 0"),
+            ("onedrive_item_id", "TEXT DEFAULT ''"),
+            ("onedrive_url", "TEXT DEFAULT ''"),
         ]
         for column, definition in migrations:
             try:
@@ -510,6 +516,56 @@ def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bo
     return True
 
 
+def upload_report_to_onedrive(media_id: str, title: str, filepath: Path) -> bool:
+    """上传单份研报到 OneDrive（按撰写方分文件夹，同名覆盖，幂等）。
+
+    目标路径：``{ONEDRIVE_ROOT_FOLDER}/{撰写方}/{title}``；撰写方优先取 DB 的
+    ``author``，为空时从文件名前缀解析。与 SharePoint 上传不同，**不写元数据列**。
+
+    返回是否上传成功（已上传视为成功）。
+    """
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT author, onedrive_ts FROM reports WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+
+    if row is None:
+        print(f"[onedrive] 未找到记录: {media_id}")
+        return False
+
+    author, od_ts = row
+    if od_ts > 0:
+        return True  # 已上传
+
+    if not author:
+        author = parse_author(title)
+
+    if not filepath.exists():
+        print(f"[onedrive] 本地文件不存在 ({title}): {filepath}")
+        return False
+
+    try:
+        result = onedrive.upload_report(title, author, filepath.read_bytes())
+    except onedrive.OneDriveError as e:
+        print(f"[onedrive] 错误 ({title}): {e}")
+        return False
+    except Exception as e:
+        print(f"[onedrive] 失败 ({title}): {e}")
+        return False
+
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE reports SET onedrive_ts = ?, onedrive_item_id = ?, onedrive_url = ? "
+            "WHERE media_id = ?",
+            (int(time.time()), result.get("id", ""), result.get("webUrl", ""), media_id),
+        )
+        conn.commit()
+
+    print(f"[onedrive] ✓ {result.get('folder', '')}/{title}")
+    return True
+
+
 def send_list_email() -> bool:
     """发送 High priority 研报汇总邮件（英文）到 LIST_EMAIL_TO。
 
@@ -759,13 +815,17 @@ def collect_reports() -> int:
     return new_count
 
 
-def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
+def download_and_send_new_reports(
+    send_only: bool = False, send_mail: bool = True
+) -> tuple[int, int]:
     """下载、（可选）上传、逐封附件发送研报。
 
     - UPLOAD_TO_SHAREPOINT=True 时，已下载研报在发送邮件前先上传 SharePoint。
     - 每个研报发送一封带附件的邮件。
 
     send_only=True 时只处理已下载未发送的存量，跳过下载。
+    send_mail=False 时跳过所有研报邮件发送（``--no-mail``），
+    下载/分类/上传照常执行，且不写 sendmail_ts（下次仍可补发）。
 
     返回 (downloaded_count, sent_count)。
     """
@@ -775,6 +835,8 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
     def _maybe_upload(item: dict[str, Any], filepath: Path) -> None:
         if UPLOAD_TO_SHAREPOINT:
             upload_report_to_sharepoint(item["media_id"], item["title"], filepath)
+        if UPLOAD_TO_ONEDRIVE:
+            upload_report_to_onedrive(item["media_id"], item["title"], filepath)
 
     def _classify_and_locate(media_id: str, title: str, save_dir: Path) -> Path:
         """下载后对研报分类，返回分类后的文件路径；分类失败返回原路径。"""
@@ -786,7 +848,10 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
     # ── Phase 1: 已下载未发送的存量 ──
     pending_sends = get_reports_to_send()
     if pending_sends:
-        print(f"[sendmail] 处理 {len(pending_sends)} 条已下载未发送的存量")
+        if send_mail:
+            print(f"[sendmail] 处理 {len(pending_sends)} 条已下载未发送的存量")
+        else:
+            print(f"[sendmail] 处理 {len(pending_sends)} 条存量（已跳过发信，仅补上传）")
         for item in pending_sends:
             title = item["title"]
             filepath = _resolve_path(item["path"]) / title
@@ -795,6 +860,9 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
                 continue
 
             _maybe_upload(item, filepath)
+
+            if not send_mail:
+                continue  # 跳过发信，不写 sendmail_ts
 
             result = send_email(title, filepath)
             if result == SEND_OK:
@@ -827,13 +895,18 @@ def download_and_send_new_reports(send_only: bool = False) -> tuple[int, int]:
 
                 _maybe_upload(item, filepath)
 
-                if send_email(title, filepath) == SEND_OK:
+                if send_mail and send_email(title, filepath) == SEND_OK:
                     mark_sent(media_id)
                     sent_count += 1
         else:
             print("[download] 没有需要下载的新研报")
 
-    print(f"[summary] 本次下载 {download_count}，发送 {sent_count}，完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if send_mail:
+        print(f"[summary] 本次下载 {download_count}，发送 {sent_count}，"
+              f"完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        print(f"[summary] 本次下载 {download_count}，已跳过发信（--no-mail），"
+              f"完成时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return download_count, sent_count
 
 
@@ -848,12 +921,18 @@ def main() -> None:
     parser.add_argument(
         "--sendonly",
         action="store_true",
-        help="只发送已下载未发送的研报，不执行搜索和下载",
+        help="只处理已下载未发送的研报（上传/发信），不执行搜索和下载",
     )
     parser.add_argument(
         "--send-list",
         action="store_true",
         help="向 LIST_EMAIL_TO 发送 High priority 研报汇总邮件（英文），不执行下载/发送",
+    )
+    parser.add_argument(
+        "--mail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否发送研报邮件（缺省开启；--no-mail 跳过发信，下载与上传照常）",
     )
     args = parser.parse_args()
 
@@ -869,7 +948,7 @@ def main() -> None:
 
     if args.sendonly:
         init_db()
-        download_and_send_new_reports(send_only=True)
+        download_and_send_new_reports(send_only=True, send_mail=args.mail)
         return
 
     if not IMA_API_KEY or not IMA_CLIENT_ID:
@@ -879,7 +958,7 @@ def main() -> None:
     init_db()
     get_knowledge_base_id()
     collect_reports()
-    download_and_send_new_reports()
+    download_and_send_new_reports(send_mail=args.mail)
 
 
 if __name__ == "__main__":
