@@ -169,6 +169,23 @@ def site_url() -> str:
     return f"https://{ONEDRIVE_TENANT}.sharepoint.com{ONEDRIVE_SITE_PATH}"
 
 
+def root_folder_url(encoded: bool = True) -> str:
+    """研报根文件夹的浏览 URL（含文档库路径）。
+
+    形如 ``{site}/Shared Documents/{ONEDRIVE_ROOT_FOLDER}``；未配置
+    ``ONEDRIVE_DRIVE_NAME`` 时按站点默认文档库名 ``Shared Documents``。
+
+    ``encoded=True`` 返回百分号编码后的链接（适合放进 href）；
+    ``encoded=False`` 返回原始中文路径（适合作为显示文本）。
+    """
+    base = site_url()
+    if not base:
+        return ""
+    drive_name = ONEDRIVE_DRIVE_NAME or "Shared Documents"
+    raw = f"{base}/{drive_name}/{ONEDRIVE_ROOT_FOLDER}"
+    return quote(raw, safe=":/") if encoded else raw
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Graph 路径封装
 # ═══════════════════════════════════════════════════════════════════════

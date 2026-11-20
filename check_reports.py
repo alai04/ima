@@ -51,6 +51,7 @@ ROOT_KB_ID = ""
 # 根目录 → "<年份>年国际顶级投行研报" → "9月" → "9.11"（日期文件夹）
 KB_TZ = ZoneInfo("Asia/Shanghai")  # 知识库按北京时间创建日期文件夹
 COLLECT_DAYS = 3                    # 只扫描最近 3 天的日期文件夹
+ONEDRIVE_LIST_HOURS = 24            # --send-list-onedrive 汇总的时间窗口（小时）
 FOLDER_MEDIA_TYPE = 99              # knowledge_list 中文件夹条目的 media_type
 _DAY_FOLDER_RE = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})$")  # 例: '9.11'
 _MONTH_FOLDER_RE = re.compile(r"^(\d{1,2})月?$")            # 例: '9月'
@@ -566,23 +567,66 @@ def upload_report_to_onedrive(media_id: str, title: str, filepath: Path) -> bool
     return True
 
 
+def _list_account(tag: str) -> Account | None:
+    """校验 LIST 邮件所需配置并返回已认证 Account；不可用时返回 None。"""
+    if not LIST_EMAIL_TO:
+        print(f"[{tag}] 缺少 LIST_EMAIL_TO 环境变量，跳过")
+        return None
+
+    if not EMAIL_FROM:
+        print(f"[{tag}] 缺少 EMAIL_FROM 环境变量，跳过")
+        return None
+
+    account = _get_account()
+    if not account:
+        print(f"[{tag}] O365 未认证，跳过")
+        return None
+    return account
+
+
+def _send_list_mail(account: Account, tag: str, subject: str, body: str, count: int) -> bool:
+    """把汇总邮件正文发送到 LIST_EMAIL_TO。"""
+    try:
+        m = account.new_message(resource=EMAIL_FROM)
+        for addr in _parse_recipients(LIST_EMAIL_TO):
+            m.to.add(addr)
+        m.subject = subject
+        m.body = body
+        m.send()
+        print(f"[{tag}] ✓ 已发送至 {', '.join(_parse_recipients(LIST_EMAIL_TO))}（{count} 条）")
+        return True
+    except Exception as e:
+        print(f"[{tag}] ✗ 发送失败: {e}")
+        return False
+
+
+def _build_list_items(
+    rows: list[tuple[str, str, str, str, str, str, str]],
+) -> str:
+    """把 (title, author, report_date, level1, level2, level3, url) 渲染为 <li> 列表。"""
+    items_html = ""
+    for title, author, report_date, level1, level2, level3, url in rows:
+        category = " / ".join(x for x in (level1, level2, level3) if x) or "N/A"
+        title_html = html.escape(title)
+        if url:
+            title_html = f'<a href="{html.escape(url, quote=True)}">{title_html}</a>'
+        items_html += (
+            f"<li>{title_html}"
+            f"<br><small>Author: {html.escape(author or 'N/A')}"
+            f" | Date: {html.escape(report_date or 'N/A')}"
+            f" | Category: {html.escape(category)}</small></li>"
+        )
+    return items_html
+
+
 def send_list_email() -> bool:
     """发送 High priority 研报汇总邮件（英文）到 LIST_EMAIL_TO。
 
     正文列出最新的 20 个 High priority 研报的标题/撰写方/日期/分类，
     末尾附 SharePoint 站点链接。
     """
-    if not LIST_EMAIL_TO:
-        print("[list] 缺少 LIST_EMAIL_TO 环境变量，跳过")
-        return False
-
-    if not EMAIL_FROM:
-        print("[list] 缺少 EMAIL_FROM 环境变量，跳过")
-        return False
-
-    account = _get_account()
+    account = _list_account("list")
     if not account:
-        print("[list] O365 未认证，跳过")
         return False
 
     with sqlite3.connect(str(DB_PATH)) as conn:
@@ -596,18 +640,7 @@ def send_list_email() -> bool:
         print("[list] 没有 High priority 研报")
         return False
 
-    items_html = ""
-    for title, author, report_date, level1, level2, level3, sharepoint_url in rows:
-        category = " / ".join(x for x in (level1, level2, level3) if x) or "N/A"
-        title_html = html.escape(title)
-        if sharepoint_url:
-            title_html = f'<a href="{html.escape(sharepoint_url, quote=True)}">{title_html}</a>'
-        items_html += (
-            f"<li>{title_html}"
-            f"<br><small>Author: {html.escape(author or 'N/A')}"
-            f" | Date: {html.escape(report_date or 'N/A')}"
-            f" | Category: {html.escape(category)}</small></li>"
-        )
+    items_html = _build_list_items(rows)
 
     site_link = sharepoint.site_url()
     link_html = ""
@@ -620,18 +653,66 @@ def send_list_email() -> bool:
         f"{link_html}"
     )
 
-    try:
-        m = account.new_message(resource=EMAIL_FROM)
-        for addr in _parse_recipients(LIST_EMAIL_TO):
-            m.to.add(addr)
-        m.subject = f"Latest Research Reports ({datetime.now().strftime('%Y-%m-%d')})"
-        m.body = body
-        m.send()
-        print(f"[list] ✓ 已发送至 {', '.join(_parse_recipients(LIST_EMAIL_TO))}（{len(rows)} 条）")
-        return True
-    except Exception as e:
-        print(f"[list] ✗ 发送失败: {e}")
+    return _send_list_mail(
+        account,
+        "list",
+        f"Latest Research Reports ({datetime.now().strftime('%Y-%m-%d')})",
+        body,
+        len(rows),
+    )
+
+
+def send_onedrive_list_email(hours: int = ONEDRIVE_LIST_HOURS) -> bool:
+    """发送最近 ``hours`` 小时内上传至 OneDrive 的研报汇总邮件（英文）。
+
+    与 :func:`send_list_email` 的区别：
+
+    * 不做 priority 过滤，取窗口内**所有**已上传 OneDrive 的研报；
+    * 标题链接指向 OneDrive 的 ``webUrl``（``onedrive_url`` 列）；
+    * 末尾附 OneDrive 站点链接。
+    """
+    account = _list_account("list-onedrive")
+    if not account:
         return False
+
+    cutoff = int(time.time()) - hours * 3600
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        rows = conn.execute(
+            "SELECT title, author, report_date, level1, level2, level3, onedrive_url "
+            "FROM reports WHERE onedrive_ts > ? "
+            "ORDER BY onedrive_ts DESC, report_date DESC",
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        print(f"[list-onedrive] 最近 {hours} 小时没有上传至 OneDrive 的研报")
+        return False
+
+    items_html = _build_list_items(rows)
+
+    site_link = onedrive.root_folder_url()
+    site_label = onedrive.root_folder_url(encoded=False)
+    link_html = ""
+    if site_link:
+        link_html = (
+            f'<p>Access all reports on OneDrive: '
+            f'<a href="{html.escape(site_link, quote=True)}">{html.escape(site_label)}</a></p>'
+        )
+
+    body = (
+        f"<p>Here are the research reports uploaded to OneDrive "
+        f"in the last {hours} hours:</p>"
+        f"<ul>{items_html}</ul>"
+        f"{link_html}"
+    )
+
+    return _send_list_mail(
+        account,
+        "list-onedrive",
+        f"Research Reports Uploaded to OneDrive ({datetime.now().strftime('%Y-%m-%d')})",
+        body,
+        len(rows),
+    )
 
 
 def _format_ts_range(ts_list: list[int]) -> str:
@@ -929,6 +1010,14 @@ def main() -> None:
         help="向 LIST_EMAIL_TO 发送 High priority 研报汇总邮件（英文），不执行下载/发送",
     )
     parser.add_argument(
+        "--send-list-onedrive",
+        action="store_true",
+        help=(
+            "向 LIST_EMAIL_TO 发送最近 24 小时上传至 OneDrive 的研报汇总邮件（英文，"
+            "含 OneDrive 链接），不执行下载/发送"
+        ),
+    )
+    parser.add_argument(
         "--mail",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -944,6 +1033,11 @@ def main() -> None:
     if args.send_list:
         init_db()
         send_list_email()
+        return
+
+    if args.send_list_onedrive:
+        init_db()
+        send_onedrive_list_email()
         return
 
     if args.sendonly:

@@ -110,6 +110,7 @@ uv run python upload_to_onedrive.py --force        # 已传过的也重传（覆
 | `--status` | 汇总研报下载/发送状态并发状态邮件，不下载 |
 | `--sendonly` | 只处理已下载未发送的存量（上传 + 发信），不搜索、不下载 |
 | `--send-list` | 向 `LIST_EMAIL_TO` 发 High priority 汇总邮件（英文），不下载 |
+| `--send-list-onedrive` | 向 `LIST_EMAIL_TO` 发最近 24 小时上传至 OneDrive 的研报汇总邮件（英文，标题链接为 OneDrive URL），不下载 |
 | `--mail` / `--no-mail` | 是否发送研报邮件，**缺省开启**。`--no-mail` 时跳过发信（不写 `sendmail_ts`，后续可补发），下载/分类/上传 SharePoint/上传 OneDrive 均照常执行 |
 | `-h, --help` | 查看帮助 |
 
