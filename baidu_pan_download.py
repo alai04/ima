@@ -42,7 +42,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import requests
 
@@ -124,6 +124,9 @@ TRANSFER_ERRNO_MSG = {
 
 _lock = threading.Lock()
 
+# 当前活跃的聚合下载进度条（供 log() 在打印前清掉进度行，避免串行）
+_active_progress: "DownloadProgress | None" = None
+
 
 class PanError(RuntimeError):
     """网盘操作失败。"""
@@ -133,8 +136,10 @@ class PanError(RuntimeError):
 
 
 def log(msg: str) -> None:
-    """线程安全的日志输出。"""
+    """线程安全的日志输出（有活跃的终端进度条时，先把它从当前行清掉）。"""
     with _lock:
+        if _active_progress is not None and _active_progress.live:
+            sys.stdout.write("\r" + " " * 80 + "\r")
         print(msg, flush=True)
 
 
@@ -145,6 +150,85 @@ def human_size(num: float) -> str:
             return f"{num:.1f}{unit}" if unit != "B" else f"{int(num)}B"
         num /= 1024
     return f"{num:.1f}TB"
+
+
+class DownloadProgress:
+    """聚合多个下载线程的字节进度，显示总进度。
+
+    * 输出是终端（TTY）：单行进度条原地刷新，并与 :func:`log` 互不干扰；
+    * 输出被重定向：每跨过 10% 打一行日志，避免往文件里塞一堆 ``\\r``。
+    """
+
+    def __init__(self, total_bytes: int) -> None:
+        self.total = max(int(total_bytes), 0)
+        self.done = 0
+        self.live = sys.stdout.isatty()
+        self._counter = threading.Lock()
+        self._last_render = 0.0
+        self._last_band = -1
+
+    def activate(self) -> None:
+        """标记为活跃进度条（供 :func:`log` 感知，打印日志前先清进度行）。"""
+        global _active_progress
+        _active_progress = self
+
+    def add(self, nbytes: int) -> None:
+        """累加新写入的字节数（线程安全）。"""
+        if nbytes <= 0:
+            return
+        with self._counter:
+            self.done += nbytes
+        self.render()
+
+    def render(self) -> None:
+        now = time.time()
+        with self._counter:
+            done = self.done
+        total = self.total
+
+        if not total:  # 总大小未知时只显示已下载字节数
+            if now - self._last_render < 5.0:
+                return
+            self._last_render = now
+            msg = f"    已下载 {human_size(done)}"
+            if self.live:
+                with _lock:
+                    sys.stdout.write("\r" + msg)
+                    sys.stdout.flush()
+            else:
+                log(msg)
+            return
+
+        pct = min(done / total * 100.0, 100.0)
+        if self.live:
+            if now - self._last_render < 0.2 and done < total:
+                return
+            self._last_render = now
+            width = 30
+            filled = min(int(width * done / total), width)
+            bar = "█" * filled + "░" * (width - filled)
+            line = (
+                f"\r    下载进度 {pct:5.1f}% [{bar}] "
+                f"{human_size(done)}/{human_size(total)}"
+            )
+            with _lock:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        else:
+            band = int(done / total * 100.0) // 10 * 10
+            if band > self._last_band or (now - self._last_render > 30.0 and done < total):
+                self._last_band = band
+                self._last_render = now
+                log(f"    下载进度 {pct:5.1f}%（{human_size(done)}/{human_size(total)}）")
+
+    def close(self) -> None:
+        """收尾：终端模式下换行收口，并解除活跃标记。"""
+        global _active_progress
+        if self.live:
+            with _lock:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+        _active_progress = None
 
 
 def extract_surl(url: str) -> str:
@@ -1148,6 +1232,7 @@ class BaiduPan:
         expected_size: int | None = None,
         expected_md5: str = "",
         verify_md5: bool = False,
+        on_progress: Callable[[int], None] | None = None,
     ) -> None:
         """流式下载（支持断点续传），失败自动换 UA / 重连续传重试。
 
@@ -1169,7 +1254,7 @@ class BaiduPan:
             ua = DOWNLOAD_UAS[attempt % len(DOWNLOAD_UAS)]
             before = tmp.stat().st_size if tmp.exists() else 0
             try:
-                self._stream(url, tmp, ua, bduss, expected_size)
+                self._stream(url, tmp, ua, bduss, expected_size, on_progress)
                 os.replace(tmp, dest)
                 if expected_size and dest.stat().st_size != expected_size:
                     raise PanError(
@@ -1192,7 +1277,13 @@ class BaiduPan:
         raise PanError(errors[-1] if errors else "下载失败")
 
     def _stream(
-        self, url: str, tmp: Path, ua: str, bduss: str, expected_size: int | None
+        self,
+        url: str,
+        tmp: Path,
+        ua: str,
+        bduss: str,
+        expected_size: int | None,
+        on_progress: Callable[[int], None] | None = None,
     ) -> None:
         """单次下载尝试，写入 tmp（带 Range 续传）。"""
         pos = tmp.stat().st_size if tmp.exists() else 0
@@ -1228,6 +1319,8 @@ class BaiduPan:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         fh.write(chunk)
+                        if on_progress:
+                            on_progress(len(chunk))
         except PanError:
             raise
         except Exception as exc:  # noqa: BLE001 - SSL/bad record mac、连接重置、分块中断…
@@ -1992,6 +2085,8 @@ def run_downloads(
     done = 0
     failed: list[str] = []
     counter_lock = threading.Lock()
+    progress = DownloadProgress(total_bytes)
+    progress.activate()
 
     def worker(plan: Plan) -> tuple[Plan, str]:
         dest = out_dir / plan.rel_path
@@ -2009,6 +2104,7 @@ def run_downloads(
                 expected_size=plan.size or None,
                 expected_md5=plan.md5,
                 verify_md5=args.verify_md5,
+                on_progress=progress.add,
             )
         except Exception as exc:  # noqa: BLE001 - 单文件失败不影响整体
             return plan, f"失败：{exc}"
@@ -2030,6 +2126,8 @@ def run_downloads(
             if status.startswith("失败"):
                 failed.append(plan.rel_path)
             log(f"  [{idx}/{total}] {plan.rel_path} … {status}")
+
+    progress.close()
 
     if failed:
         log(f"→ 完成，失败 {len(failed)} 个：")
