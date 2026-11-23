@@ -224,7 +224,8 @@ Cookie 里必须同时有 `BDUSS` 和 `STOKEN`，否则网盘接口会返回 err
   并把文件**移动到** `categorized_reports/{一级}/{二级}/[{三级}/]`，同步更新 `path`。
   未配置 `DEEPSEEK_API_KEY` 或分类失败时文件保持原位置。
 * **上传**：`check_reports.upload_report_to_sharepoint()`（幂等，已上传则直接跳过）；
-  `check_reports.upload_report_to_onedrive()` 另按撰写方分文件夹上传（同名覆盖，幂等）。
+  `check_reports.upload_report_to_onedrive()` 另按撰写方分文件夹上传（幂等：`onedrive_ts > 0`
+  或远端已存在同名文件时**不再重复上传**，仅回填 item id / webUrl）。
 * **发邮件**：`check_reports.send_email()`，成功后标记 `sendmail_ts`。
 
 失败隔离与幂等：

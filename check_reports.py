@@ -517,11 +517,30 @@ def upload_report_to_sharepoint(media_id: str, title: str, filepath: Path) -> bo
     return True
 
 
-def upload_report_to_onedrive(media_id: str, title: str, filepath: Path) -> bool:
-    """上传单份研报到 OneDrive（按撰写方分文件夹，同名覆盖，幂等）。
+def _record_onedrive_upload(media_id: str, result: dict[str, Any]) -> None:
+    """回写 OneDrive 上传结果（时间戳 / item id / webUrl）。"""
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE reports SET onedrive_ts = ?, onedrive_item_id = ?, onedrive_url = ? "
+            "WHERE media_id = ?",
+            (int(time.time()), result.get("id", ""), result.get("webUrl", ""), media_id),
+        )
+        conn.commit()
+
+
+def upload_report_to_onedrive(
+    media_id: str, title: str, filepath: Path, force: bool = False
+) -> bool:
+    """上传单份研报到 OneDrive（按撰写方分文件夹，幂等，已上传则跳过）。
 
     目标路径：``{ONEDRIVE_ROOT_FOLDER}/{撰写方}/{title}``；撰写方优先取 DB 的
     ``author``，为空时从文件名前缀解析。与 SharePoint 上传不同，**不写元数据列**。
+
+    去重规则（两重判断，``force=True`` 时全部跳过并强制覆盖上传）：
+
+    1. DB 中 ``onedrive_ts > 0`` → 视为已上传，直接返回成功；
+    2. DB 未标记时再探测远端：目标路径下已存在同名文件则**不重复上传**，
+       仅把远端 item id / webUrl 回填进 DB（例如 DB 重建、换机器等情况）。
 
     返回是否上传成功（已上传视为成功）。
     """
@@ -536,11 +555,31 @@ def upload_report_to_onedrive(media_id: str, title: str, filepath: Path) -> bool
         return False
 
     author, od_ts = row
-    if od_ts > 0:
-        return True  # 已上传
+    if od_ts > 0 and not force:
+        print(f"[onedrive] 已上传过，跳过: {title}")
+        return True
 
     if not author:
         author = parse_author(title)
+
+    folder = onedrive.target_folder(author, title)
+
+    # DB 未标记时探测远端同名文件，避免重复上传（探测失败不阻断上传）
+    if not force:
+        try:
+            remote = onedrive.get_item(onedrive.join_path(folder, title))
+        except Exception:
+            remote = None
+        if remote is not None:
+            _record_onedrive_upload(
+                media_id,
+                {
+                    "id": remote.get("id", ""),
+                    "webUrl": remote.get("webUrl", ""),
+                },
+            )
+            print(f"[onedrive] 远端已存在，跳过上传: {folder}/{title}")
+            return True
 
     if not filepath.exists():
         print(f"[onedrive] 本地文件不存在 ({title}): {filepath}")
@@ -555,13 +594,7 @@ def upload_report_to_onedrive(media_id: str, title: str, filepath: Path) -> bool
         print(f"[onedrive] 失败 ({title}): {e}")
         return False
 
-    with sqlite3.connect(str(DB_PATH)) as conn:
-        conn.execute(
-            "UPDATE reports SET onedrive_ts = ?, onedrive_item_id = ?, onedrive_url = ? "
-            "WHERE media_id = ?",
-            (int(time.time()), result.get("id", ""), result.get("webUrl", ""), media_id),
-        )
-        conn.commit()
+    _record_onedrive_upload(media_id, result)
 
     print(f"[onedrive] ✓ {result.get('folder', '')}/{title}")
     return True
