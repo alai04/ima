@@ -51,7 +51,7 @@ ROOT_KB_ID = ""
 # 根目录 → "<年份>年国际顶级投行研报" → "9月" → "9.11"（日期文件夹）
 KB_TZ = ZoneInfo("Asia/Shanghai")  # 知识库按北京时间创建日期文件夹
 COLLECT_DAYS = 3                    # 只扫描最近 3 天的日期文件夹
-ONEDRIVE_LIST_HOURS = 24            # --send-list-onedrive 汇总的时间窗口（小时）
+ONEDRIVE_LIST_HOURS = int(os.getenv("ONEDRIVE_LIST_HOURS", 24))            # --send-list-onedrive 汇总的时间窗口（小时）
 FOLDER_MEDIA_TYPE = 99              # knowledge_list 中文件夹条目的 media_type
 _DAY_FOLDER_RE = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})$")  # 例: '9.11'
 _MONTH_FOLDER_RE = re.compile(r"^(\d{1,2})月?$")            # 例: '9月'
